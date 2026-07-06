@@ -3,20 +3,32 @@ import math
 import argparse
 from rclpy.node import Node
 from rcl_interfaces.msg import SetParametersResult
-from rclpy.qos import QoSProfile, ReliabilityPolicy, DurabilityPolicy, HistoryPolicy
+from rclpy.qos import QoSProfile, ReliabilityPolicy
 from rclpy.action import ActionClient
 from rclpy.callback_groups import ReentrantCallbackGroup
 from rclpy.executors import MultiThreadedExecutor
-from geometry_msgs.msg import PointStamped, Point
+from geometry_msgs.msg import PointStamped, Point, PoseStamped
 from robomaster_msgs.action import MoveArm
+import tf2_ros
+from scipy.spatial.transform import Rotation as R
+from tft2_ros import TransformBroadcaster
+import tf_transformations
+import numpy as np
+
+
+
 
 class EEControllerNode(Node):
     def __init__(self, robot_id):
         super().__init__('ee_controller_node')
         self.robot_name = f"/robot{robot_id}"
-
+        self.tf_buffer = tf2_ros.Buffer()
+        self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
+        self.tf_broadcaster = TransformBroadcaster()
         # Declare variables of interest here. Mainly end effector position, and desired position
         self.ee_position = None
+        self.hockey_stick_position = None
+        self.robot_position = None
         # Declare parameters
         self.declare_parameter('control_frequency', 10.0)
 
@@ -30,14 +42,18 @@ class EEControllerNode(Node):
         # Create a QoS profile for publishers and subscribers
         # TODO: May need to change based on subscription Qos Profile
         qos = QoSProfile(
-            reliability=ReliabilityPolicy.RELIABLE,
-            durability=DurabilityPolicy.VOLATILE,
-            history=HistoryPolicy.KEEP_LAST,
+            reliability=ReliabilityPolicy.BEST_EFFORT,
             depth=10
         )
         # Create Subscribers and Publishers with appropriate QoS settings
+        # Subscription to the hockey stick wrt to the world frame
+        self.create_subscription(PoseStamped, '/vrpn_mocap/hockey_sticks_1/pose', self.hockey_stick_pos_callback, qos)
+        # Subscription to the robot pose wrt to the world frame
+        self.create_subscription(PoseStamped, '/vrpn_mocap/dji_robot_8/pose', self.robot_pos_callback, qos)
+
         # Subscription to end effector state. Possibly arm_position
         # TODO: Get the proper topic name
+
         self.create_subscription(PointStamped, f'{self.robot_name}/arm_position', self.arm_position_callback, qos)
 
         # Use move_arm action server since its safer
@@ -47,11 +63,21 @@ class EEControllerNode(Node):
         # TODO: Once the action server name is confirmed
         # self.move_arm_client.wait_for_server()
         # Logger to show the node is running
+        self.target_frame =  'robot8/arm_base_link'
+        self.source_frame = 'world'
         self.get_logger().info(f'EEControllerNode initialized for robot ID: {robot_id} with control frequency: {self.control_frequency} Hz @ {self.robot_name}')
 
     def control_loop(self):
         # Implement the control logic here
         self.get_logger().info('Control loop running...')
+        if self.hockey_stick_position is not None:
+            self.get_logger().info(f"Hockey Stick coordinates {self.hockey_stick_position.pose.position.x}, {self.hockey_stick_position.pose.position.z}")
+        if self.ee_position is not None:
+            self.get_logger().info(f"EE coordinates {self.ee_position.point.x}, {self.ee_position.point.z}")
+        # Get the matrix conversion
+        hm_trans = self.convert_hockey_stick_to_arm_frame()
+        self.get_logger().info(f"Homogeneous Matrix: {hm_trans}")
+        # Extract the x, z coordinates from the homogenous matrix
         # TODO: Uncomment once action server confirmed
         # goal = MoveArm.Goal()
         # # Calculate x, z fields based on the current end effector position and desired position
@@ -62,6 +88,27 @@ class EEControllerNode(Node):
         # goal.relative = False
         # future = self.move_arm_client.send_goal_async(goal)
         # future.add_done_callback(self.move_arm_goal_response)
+    
+    def convert_to_matrix(self, pose_msg: PoseStamped) -> np.ndarray:
+        pos = pose_msg.pose.position
+        translation = np.array([pos.x, pos.y, pos.z])
+        ori = pose_msg.pose.orientation
+        quat = [ori.x, ori.y, ori.z, ori.w]
+        rotation_matrix = tf_transformations.quaternion_matrix(quat)[:3, :3]
+        homogeneous_matrix = np.eye(4)
+        homogeneous_matrix[:3, :3] = rotation_matrix
+        homogeneous_matrix[:3, 3] = translation
+        return homogeneous_matrix
+
+    def convert_hockey_stick_to_arm_frame(self):
+        robot_to_arm_frame = np.array([[1, 0, 0, -0.14],
+                                       [0, 1, 0, 0],
+                                       [0, 0, 1, 0.1],
+                                       [0, 0, 0, 1]])
+        robot_to_world_frame = self.convert_to_matrix(self.robot_position)
+        world_to_robot_frame = np.linalg.inv(robot_to_world_frame)
+        hockey_stick_to_world_frame = self.convert_to_matrix(self.hockey_stick_position)
+        return robot_to_arm_frame @ world_to_robot_frame @ hockey_stick_to_world_frame
 
     def move_arm_goal_response(self, future):
         goal_handle = future.result()
@@ -74,19 +121,17 @@ class EEControllerNode(Node):
 
     def move_arm_result_callback(self, future):
         result = future.result().result
-        self.get_logger().info(f'Move arm result: {result}')
 
     # For the subscription to the ee position, just log for now
     def arm_position_callback(self, msg):
         self.ee_position = msg
-
     
+    def hockey_stick_pos_callback(self, msg):
+        self.hockey_stick_position = msg
 
+    def robot_pos_callback(self, msg):
+        self.robot_position = msg
     
-
-    
-
-
 def main(args=None):
     parser = argparse.ArgumentParser()
     parser.add_argument('--robot_id', type=int, default=1, help='ID of the robot to control')
