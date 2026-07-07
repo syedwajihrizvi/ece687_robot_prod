@@ -1,30 +1,20 @@
 import rclpy
-import math
 import argparse
 from rclpy.node import Node
-from rcl_interfaces.msg import SetParametersResult
 from rclpy.qos import QoSProfile, ReliabilityPolicy
 from rclpy.action import ActionClient
 from rclpy.callback_groups import ReentrantCallbackGroup
 from rclpy.executors import MultiThreadedExecutor
 from geometry_msgs.msg import PointStamped, Point, PoseStamped
 from robomaster_msgs.action import MoveArm
-import tf2_ros
 from scipy.spatial.transform import Rotation as R
-from tft2_ros import TransformBroadcaster
-import tf_transformations
 import numpy as np
-
-
 
 
 class EEControllerNode(Node):
     def __init__(self, robot_id):
         super().__init__('ee_controller_node')
         self.robot_name = f"/robot{robot_id}"
-        self.tf_buffer = tf2_ros.Buffer()
-        self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
-        self.tf_broadcaster = TransformBroadcaster()
         # Declare variables of interest here. Mainly end effector position, and desired position
         self.ee_position = None
         self.hockey_stick_position = None
@@ -49,11 +39,10 @@ class EEControllerNode(Node):
         # Subscription to the hockey stick wrt to the world frame
         self.create_subscription(PoseStamped, '/vrpn_mocap/hockey_sticks_1/pose', self.hockey_stick_pos_callback, qos)
         # Subscription to the robot pose wrt to the world frame
-        self.create_subscription(PoseStamped, '/vrpn_mocap/dji_robot_8/pose', self.robot_pos_callback, qos)
+        self.create_subscription(PoseStamped, f'/vrpn_mocap/dji_robot_{robot_id}/pose', self.robot_pos_callback, qos)
 
         # Subscription to end effector state. Possibly arm_position
         # TODO: Get the proper topic name
-
         self.create_subscription(PointStamped, f'{self.robot_name}/arm_position', self.arm_position_callback, qos)
 
         # Use move_arm action server since its safer
@@ -88,13 +77,13 @@ class EEControllerNode(Node):
         # goal.relative = False
         # future = self.move_arm_client.send_goal_async(goal)
         # future.add_done_callback(self.move_arm_goal_response)
-    
+        
     def convert_to_matrix(self, pose_msg: PoseStamped) -> np.ndarray:
         pos = pose_msg.pose.position
-        translation = np.array([pos.x, pos.y, pos.z])
         ori = pose_msg.pose.orientation
+        translation = np.array([pos.x, pos.y, pos.z])
         quat = [ori.x, ori.y, ori.z, ori.w]
-        rotation_matrix = tf_transformations.quaternion_matrix(quat)[:3, :3]
+        rotation_matrix = R.from_quat(quat).as_matrix()
         homogeneous_matrix = np.eye(4)
         homogeneous_matrix[:3, :3] = rotation_matrix
         homogeneous_matrix[:3, 3] = translation
