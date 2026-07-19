@@ -75,7 +75,7 @@ class Robot(Node):
             self.get_logger().warn("Waiting for robot pose...", throttle_duration_sec=2.0)
             return
         
-        if self.current_sequence in [1, 3]:
+        if self.current_sequence in [1, 4]:
             self.current_target_pose = self.hockey_stick_pose if self.current_sequence == 1 else self.puck_pose
             
             if self.current_target_pose is None:
@@ -111,11 +111,26 @@ class Robot(Node):
             elapsed_time = (self.get_clock().now() - self.state_start_time).nanoseconds / 1e9
             
             if elapsed_time >= 5.0:
-                self.get_logger().info("5 seconds elapsed. Advancing to Sequence 3 (Move to Puck).")
+                self.get_logger().info("5 seconds elapsed. Advancing to Sequence 3 (Move Backwards).")
                 self.current_sequence += 1
                 self.state_start_time = None  # Clear timer tracking for the next state     
             
-        elif self.current_sequence == 4:
+        elif self.current_sequence == 3:
+            # After the robot picks up the stick, we need to move it backwards a bit and rotate
+            cmd = Twist()
+            if self.state_start_time is None:
+                self.state_start_time = self.get_clock().now()
+                self.get_logger().info("Sequence 3: Moving backwards and rotating for 5 seconds...")
+            elapsed_time = (self.get_clock().now() - self.state_start_time).nanoseconds / 1e9
+            if elapsed_time < 5.0:
+                cmd.linear.x = -0.1  # Move backwards
+                self.get_logger().info(f"Sequence 3: Moving backwards. Elapsed time: {elapsed_time:.2f}s")
+                self.pub_cmd_vel.publish(cmd)
+            else:
+                self.get_logger().info("Sequence 3 completed. Advancing to Sequence 4.")
+                self.current_sequence += 1
+                self.state_start_time = None
+        elif self.current_sequence == 5:
             self.release_puck()
             self.current_sequence += 1
             
@@ -139,7 +154,6 @@ class Robot(Node):
         target_theta = np.arctan2(np.sin(target_theta), np.cos(target_theta))
         if target_theta < 0:
             target_theta += 2 * np.pi
-
         p_xl = x + l * math.cos(theta)
         p_yl = y + l * math.sin(theta)
 
@@ -153,6 +167,9 @@ class Robot(Node):
         v, w = 0.0, 0.0
         if self.rotation_phase or distance_to_target <= self.get_parameter('tolerance').value:
             self.rotation_phase = True
+            if self.current_sequence == 1:
+                flipped_target_theta = np.arctan2(np.sin(target_theta + np.pi), np.cos(target_theta + np.pi))
+                angle_error = np.arctan2(np.sin(flipped_target_theta - theta), np.cos(flipped_target_theta - theta))
             if abs(angle_error) > 0.02:
                 v = 0.0
                 w = Kp_w * angle_error
