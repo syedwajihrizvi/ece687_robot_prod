@@ -152,8 +152,6 @@ class Robot(Node):
         target_theta = self.get_yaw_from_quaternion(self.current_target_pose.orientation)
 
         target_theta = np.arctan2(np.sin(target_theta), np.cos(target_theta))
-        if target_theta < 0:
-            target_theta += 2 * np.pi
         p_xl = x + l * math.cos(theta)
         p_yl = y + l * math.sin(theta)
 
@@ -163,7 +161,6 @@ class Robot(Node):
         distance_to_target = np.sqrt((p_xg - p_xl)**2 + (p_yg - p_yl)**2)
         angle_error = target_theta - theta
         angle_error = np.arctan2(np.sin(angle_error), np.cos(angle_error))
-        self.get_logger().info(f"Distance to Target: {distance_to_target:.3f}, Angle Error: {angle_error:.3f}")
         v, w = 0.0, 0.0
         if self.rotation_phase or distance_to_target <= self.get_parameter('tolerance').value:
             self.rotation_phase = True
@@ -183,7 +180,7 @@ class Robot(Node):
 
             control_inputs = self.L_inv @ self.get_rotation_matrix(theta).transpose() @ np.array([[p_dot_x], [p_dot_y]])
             v, w = control_inputs[0, 0], control_inputs[1, 0]
-            
+        self.get_logger().info(f"Distance to Target: {distance_to_target:.3f}, Angle Error: {angle_error:.3f}")
         return float(v), float(w)
     
     def pickup_hockey_stick(self):
