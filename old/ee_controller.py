@@ -52,8 +52,6 @@ class EEControllerNode(Node):
         # TODO: Once the action server name is confirmed
         # self.move_arm_client.wait_for_server()
         # Logger to show the node is running
-        self.target_frame =  'robot8/arm_base_link'
-        self.source_frame = 'world'
         self.get_logger().info(f'EEControllerNode initialized for robot ID: {robot_id} with control frequency: {self.control_frequency} Hz @ {self.robot_name}')
 
     def control_loop(self):
@@ -61,33 +59,50 @@ class EEControllerNode(Node):
         self.get_logger().info('Control loop running...')
         if self.hockey_stick_position is not None:
             self.get_logger().info(f"Hockey Stick coordinates {self.hockey_stick_position.pose.position.x}, {self.hockey_stick_position.pose.position.z}")
+        else:
+            self.get_logger().info("Hockey stick position is None")
         if self.ee_position is not None:
             self.get_logger().info(f"EE coordinates {self.ee_position.point.x}, {self.ee_position.point.z}")
+        else:
+            self.get_logger().info(f"EE Position is None")
+        if self.robot_position is None:
+            self.get_logger().info(f"Robot position not received")
         # Get the matrix conversion
         hm_trans = self.convert_hockey_stick_to_arm_frame()
         self.get_logger().info(f"Homogeneous Matrix: {hm_trans}")
+        if hm_trans is None:
+            return
+        # Get the first row and 3rd row from fourth column
+        x = hm_trans[0, 3]
+        z = hm_trans[2, 3]
         # Extract the x, z coordinates from the homogenous matrix
         # TODO: Uncomment once action server confirmed
-        # goal = MoveArm.Goal()
+        goal = MoveArm.Goal()
+        goal.x = x
+        goal.z = z
+        goal.relative = False
         # # Calculate x, z fields based on the current end effector position and desired position
         # # Set x, z, and relative field here
         # # Should be relative to the arm base position
         # # Then we convert the target position to the arm base frame as well
-
-        # goal.relative = False
-        # future = self.move_arm_client.send_goal_async(goal)
-        # future.add_done_callback(self.move_arm_goal_response)
+        goal.relative = False
+        self.get_logger().info(f"Sending goal: {goal}")
+        future = self.move_arm_client.send_goal_async(goal)
+        future.add_done_callback(self.move_arm_goal_response)
         
     def convert_to_matrix(self, pose_msg: PoseStamped) -> np.ndarray:
-        pos = pose_msg.pose.position
-        ori = pose_msg.pose.orientation
-        translation = np.array([pos.x, pos.y, pos.z])
-        quat = [ori.x, ori.y, ori.z, ori.w]
-        rotation_matrix = R.from_quat(quat).as_matrix()
-        homogeneous_matrix = np.eye(4)
-        homogeneous_matrix[:3, :3] = rotation_matrix
-        homogeneous_matrix[:3, 3] = translation
-        return homogeneous_matrix
+        self.get_logger().info(f"Received pose_msg: {pose_msg}")
+        if pose_msg is not None:
+            pos = pose_msg.pose.position
+            ori = pose_msg.pose.orientation
+            translation = np.array([pos.x, pos.y, pos.z])
+            quat = [ori.x, ori.y, ori.z, ori.w]
+            rotation_matrix = R.from_quat(quat).as_matrix()
+            homogeneous_matrix = np.eye(4)
+            homogeneous_matrix[:3, :3] = rotation_matrix
+            homogeneous_matrix[:3, 3] = translation
+            return homogeneous_matrix
+        return None
 
     def convert_hockey_stick_to_arm_frame(self):
         robot_to_arm_frame = np.array([[1, 0, 0, -0.14],
@@ -95,8 +110,14 @@ class EEControllerNode(Node):
                                        [0, 0, 1, 0.1],
                                        [0, 0, 0, 1]])
         robot_to_world_frame = self.convert_to_matrix(self.robot_position)
+        if robot_to_world_frame is None:
+            self.get_logger().info("Robot to world frame is None")
+            return None
         world_to_robot_frame = np.linalg.inv(robot_to_world_frame)
         hockey_stick_to_world_frame = self.convert_to_matrix(self.hockey_stick_position)
+        if hockey_stick_to_world_frame is None:
+            self.get_logger().info("Hockey Stick to World frame is None")
+            return None
         return robot_to_arm_frame @ world_to_robot_frame @ hockey_stick_to_world_frame
 
     def move_arm_goal_response(self, future):
