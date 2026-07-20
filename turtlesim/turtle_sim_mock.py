@@ -1,3 +1,4 @@
+import argparse
 import numpy as np
 import rclpy
 from rclpy.node import Node
@@ -5,12 +6,18 @@ from geometry_msgs.msg import PoseStamped
 from turtlesim.srv import Spawn
 
 class TurtlesimTargetPublisher(Node):
-    def __init__(self):
+    def __init__(self, stick_x, stick_y, stick_denom, puck_x, puck_y, puck_denom):
         super().__init__('turtlesim_target_publisher')
         
-        # Define field target configurations (x, y, yaw) inside Turtlesim boundaries [0.0 - 11.0]
-        self.stick_position = (1.0, 1.0, np.pi/4)
-        self.puck_position = (9.0, 10.0, np.pi/2)
+        # Calculate orientations dynamically using np.pi divided by your denominator inputs
+        # If the denominator passed is 0, default to an angle of 0.0 to prevent zero division
+        stick_theta = np.pi / stick_denom if stick_denom != 0 else 0.0
+        puck_theta = np.pi / puck_denom if puck_denom != 0 else 0.0
+        
+        self.get_logger().info("Spawning Turtlesim Target Publisher with the following configurations:")
+        # Define field target configurations (x, y, computed_yaw)
+        self.stick_position = (stick_x, stick_y, stick_theta)
+        self.puck_position = (puck_x, puck_y, puck_theta)
         
         # Track if targets have been visually spawned yet
         self.spawned_markers = False
@@ -21,7 +28,12 @@ class TurtlesimTargetPublisher(Node):
         
         # High frequency environment update clock loop (50 Hz)
         self.timer = self.create_timer(0.02, self.environment_tick)
-        self.get_logger().info("Turtlesim Target Mock Publisher ready. Spawning asset visual pins...")
+        
+        self.get_logger().info(
+            f"Turtlesim Target Mock Publisher ready via Argparse.\n"
+            f"-> Hockey Stick Pose: ({stick_x}, {stick_y}) | Yaw: np.pi/{stick_denom} ({math.degrees(stick_theta):.1f}°)\n"
+            f"-> Puck Pose: ({puck_x}, {puck_y}) | Yaw: np.pi/{puck_denom} ({math.degrees(puck_theta):.1f}°)"
+        )
 
     def spawn_marker_turtles(self):
         client = self.create_client(Spawn, '/spawn')
@@ -65,9 +77,34 @@ class TurtlesimTargetPublisher(Node):
         msg.pose.orientation.w = np.cos(yaw / 2.0)
         return msg
 
+import math # Imported inside script boundary for logger degrees calculation cleanly
+
 def main(args=None):
-    rclpy.init(args=args)
-    node = TurtlesimTargetPublisher()
+    parser = argparse.ArgumentParser(description='Turtlesim Target Mock Publisher via Denominator Angles')
+    
+    # Hockey stick target configs
+    parser.add_argument('--stick_x', type=float, default=1.0, help='X position of hockey stick')
+    parser.add_argument('--stick_y', type=float, default=1.0, help='Y position of hockey stick')
+    parser.add_argument('--stick_denom', type=float, default=2.0, help='Denominator value to divide np.pi for stick angle (e.g., 2 for pi/2)')
+    
+    # Puck target configs
+    parser.add_argument('--puck_x', type=float, default=10.0, help='X position of puck')
+    parser.add_argument('--puck_y', type=float, default=5.5, help='Y position of puck')
+    parser.add_argument('--puck_denom', type=float, default=0.0, help='Denominator value to divide np.pi for puck angle (use 0 for flat 0.0 rotation)')
+    
+    # Filter out internal ROS arguments to safely parse your custom flags
+    parsed_args, remaining = parser.parse_known_args(args)
+    
+    rclpy.init(args=remaining)
+    node = TurtlesimTargetPublisher(
+        stick_x=parsed_args.stick_x,
+        stick_y=parsed_args.stick_y,
+        stick_denom=parsed_args.stick_denom,
+        puck_x=parsed_args.puck_x,
+        puck_y=parsed_args.puck_y,
+        puck_denom=parsed_args.puck_denom
+    )
+    
     try:
         rclpy.spin(node)
     except KeyboardInterrupt:

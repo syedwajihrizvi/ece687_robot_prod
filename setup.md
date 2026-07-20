@@ -93,7 +93,8 @@ ros2 run robot_controller move_robot_node --robot_id 1 --pass_to_robot 2
 
 
 ### 7) Useful Commands
-ros2 run robot_controller robot_node --robot_id 2 --l 0.35 --tolerance 0.15
+ros2 run robot_controller robot_node --robot_id 2 --l 0.35 --tolerance 0.3 --sideways_offset 0.115 
+python3 your_script_name.py --robot_id 1 --puck_color red --l 0.0.35 --tolerance 0.05
 ros2 run robot_controller robot_node --robot_id 2 --mock_mode --l 0.35 --tolerance 0.15
 ros2 run robot_controller mock_node --robot_id 1
 
