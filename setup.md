@@ -78,7 +78,7 @@ Open additional docker contains with same structure and shared memory
 ### Process Skeleton
 1. On a new terminal run docker ps
 2. Get id of the current docker container
-3. Run the following command on the new terminal sudo docker exec -it <docker_container_id> bash
+3. Run the following command on the new terminal sudo docker exec -it 3e720c9b5ddf bash
 4. Setup Ros
    source /opt/ros/humble/setup.bash
    source /opt/ros/ws/setup.bash
@@ -91,3 +91,10 @@ ros2 run robot_controller robot_node --robot_id 1
 For passing
 ros2 run robot_controller move_robot_node --robot_id 1 --pass_to_robot 2
 
+
+### 7) Useful Commands
+ros2 run robot_controller robot_node --robot_id 2 --l 0.35 --tolerance 0.15
+ros2 run robot_controller robot_node --robot_id 2 --mock_mode --l 0.35 --tolerance 0.15
+ros2 run robot_controller mock_node --robot_id 1
+
+ros2 run robot_controller robot_node --robot_id 1 --mock_mode --l 0.35 --tolerance 0.15
