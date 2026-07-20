@@ -77,12 +77,10 @@ class Robot(Node):
         qos = QoSProfile(reliability=ReliabilityPolicy.BEST_EFFORT, depth=10)
 
         if self.mock_mode:
-            # Dynamically uses hockey_stick_id for mock VRPN stream
             self.create_subscription(PoseStamped, f'/mock/vrpn_mocap/hockey_sticks_{self.hockey_stick_id}/pose', self.hockey_stick_pos_callback, qos)
             self.create_subscription(PoseStamped, f'/mock/vrpn_mocap/dji_robot_{robot_id}/pose', self.robot_pos_callback, qos)
             self.create_subscription(PoseStamped, '/mock/vrpn_mocap/puck_1/pose', self.puck_pos_callback, qos)
         else:
-            # Dynamically uses hockey_stick_id for real VRPN stream
             self.create_subscription(PoseStamped, f'/vrpn_mocap/hockey_sticks_{self.hockey_stick_id}/pose', self.hockey_stick_pos_callback, qos)
             self.create_subscription(PoseStamped, f'/vrpn_mocap/dji_robot_{robot_id}/pose', self.robot_pos_callback, qos)
             self.create_subscription(PoseStamped, f'/vrpn_mocap/hockey_puck_{self.puck_color}/pose', self.puck_pos_callback, qos)
@@ -122,7 +120,6 @@ class Robot(Node):
             cmd = Twist()
             v, w = self.nid_to_move_robot()
 
-            # Sequence completion check tied directly to stage flags
             if v == 0.0 and w == 0.0 and (
                 (self.current_sequence == 1 and self.seq1_completed) or 
                 (self.current_sequence == 4 and self.seq4_completed)
@@ -210,12 +207,15 @@ class Robot(Node):
 
         # --- MULTI-STAGE TRAJECTORY CONTROL FOR SEQUENCE 1 ---
         if self.current_sequence == 1:
-            # Universal Translation: Extends target point forwards along its matching heading vector
-            standoff_x = p_xg + standoff_dist * math.cos(target_theta)
-            standoff_y = p_yg + standoff_dist * math.sin(target_theta)
+            # Apply static (x, y) offset translation directly to the base target point
+            target_x = p_xg + self.get_parameter('vertical_offset').value
+            target_y = p_yg + self.get_parameter('sideways_offset').value
+
+            # Universal Translation: Extends offset target point along the stick's vector angle
+            standoff_x = target_x + standoff_dist * math.cos(target_theta)
+            standoff_y = target_y + standoff_dist * math.sin(target_theta)
 
             if self.seq1_stage == 0:
-                # Stage 1.0: Turn on spot to face the projected standoff location
                 bearing_to_standoff = np.arctan2(standoff_y - p_yl, standoff_x - p_xl)
                 angle_error = np.arctan2(np.sin(bearing_to_standoff - theta), np.cos(bearing_to_standoff - theta))
                 
@@ -227,7 +227,6 @@ class Robot(Node):
                     self.get_logger().info("[Seq 1 - Stage 0] Heading aligned to standoff vector. Advancing to Stage 1.")
 
             if self.seq1_stage == 1:
-                # Stage 1.1: Straight line translation to standoff location
                 dist = np.sqrt((standoff_x - p_xl)**2 + (standoff_y - p_yl)**2)
                 if dist <= tolerance:
                     self.seq1_stage = 2
@@ -240,7 +239,6 @@ class Robot(Node):
                     return float(control_inputs[0, 0]), float(control_inputs[1, 0])
 
             if self.seq1_stage == 2:
-                # Stage 1.2: Orient body (-180 degrees offset from target_theta)
                 flipped_target_theta = np.arctan2(np.sin(target_theta + np.pi), np.cos(target_theta + np.pi))
                 angle_error = np.arctan2(np.sin(flipped_target_theta - theta), np.cos(flipped_target_theta - theta))
                 
@@ -252,13 +250,13 @@ class Robot(Node):
                     self.get_logger().info("[Seq 1 - Stage 2] Alignment complete! Advancing to Stage 3 (Final Move).")
 
             if self.seq1_stage == 3:
-                # Stage 1.3: Translate straight down the vector path to reach the target pose
-                dist = np.sqrt((p_xg - p_xl)**2 + (p_yg - p_yl)**2)
+                # Target the translated offset point rather than the raw stick coordinate
+                dist = np.sqrt((target_x - p_xl)**2 + (target_y - p_yl)**2)
                 if dist <= tolerance:
                     self.seq1_completed = True 
                     return 0.0, 0.0  
                 else:
-                    e_x, e_y = p_xg - p_xl, p_yg - p_yl
+                    e_x, e_y = target_x - p_xl, target_y - p_yl
                     p_dot_x, p_dot_y = Kp_v * e_x, Kp_v * e_y
                     self.L_inv[1, 1] = 1.0 / l
                     control_inputs = self.L_inv @ self.get_rotation_matrix(theta).transpose() @ np.array([[p_dot_x], [p_dot_y]])
@@ -267,7 +265,6 @@ class Robot(Node):
         # --- MULTI-STAGE TRAJECTORY CONTROL FOR SEQUENCE 4 ---
         elif self.current_sequence == 4:
             if self.seq4_stage == 0:
-                # Stage 4.0: Drive directly to puck target point using NID translation
                 distance_to_target = np.sqrt((p_xg - p_xl)**2 + (p_yg - p_yl)**2)
                 if distance_to_target <= tolerance:
                     self.seq4_stage = 1
@@ -281,7 +278,6 @@ class Robot(Node):
                     return float(control_inputs[0, 0]), float(control_inputs[1, 0])
             
             if self.seq4_stage == 1:
-                # Stage 4.1: Align angle on spot to match puck's heading angle
                 angle_error = np.arctan2(np.sin(target_theta - theta), np.cos(target_theta - theta))
                 if abs(angle_error) > 0.02:
                     w = Kp_w * angle_error
