@@ -9,12 +9,13 @@ from rclpy.callback_groups import ReentrantCallbackGroup
 from geometry_msgs.msg import Twist, PoseStamped
 
 class Robot(Node):
-    def __init__(self, robot_id, pass_to_robot, mock_mode=False):
+    def __init__(self, robot_id, pass_to_robot, mock_mode=False, orient_to_stick=False):
         super().__init__(f'robot_{robot_id}_node')
         self.robot_id = robot_id
         self.robot_name = f'/robot{robot_id}'
         self.pass_to_robot = pass_to_robot
         self.mock_mode = mock_mode
+        self.orient_to_stick = orient_to_stick
 
         self.robot_pose = None
         self.hockey_stick_pose = None
@@ -27,7 +28,9 @@ class Robot(Node):
         self.declare_parameter('control_frequency', 10.0)
         self.declare_parameter('kp_v', 0.6)
         self.declare_parameter('kp_w', 0.5)
+        # TODO: Update to be the distance from Horizontal the robot's sensor to the manipulator EE
         self.declare_parameter('l', 0.15)
+        # TODO: Determine a good tolerance value
         self.declare_parameter('tolerance', 0.15)
         self.declare_parameter('start_sequence', 1) 
 
@@ -155,23 +158,23 @@ class Robot(Node):
         p_xl = x + l * math.cos(theta)
         p_yl = y + l * math.sin(theta)
 
-        p_xg += l * math.cos(target_theta)
-        p_yg += l * math.sin(target_theta)
-
         distance_to_target = np.sqrt((p_xg - p_xl)**2 + (p_yg - p_yl)**2)
         angle_error = target_theta - theta
         angle_error = np.arctan2(np.sin(angle_error), np.cos(angle_error))
         v, w = 0.0, 0.0
         if self.rotation_phase or distance_to_target <= self.get_parameter('tolerance').value:
-            self.rotation_phase = True
-            if self.current_sequence == 1:
-                flipped_target_theta = np.arctan2(np.sin(target_theta + np.pi), np.cos(target_theta + np.pi))
-                angle_error = np.arctan2(np.sin(flipped_target_theta - theta), np.cos(flipped_target_theta - theta))
-            if abs(angle_error) > 0.02:
-                v = 0.0
-                w = Kp_w * angle_error
-            else:
+            if self.current_sequence == 1 and not self.orient_to_stick:
                 v, w = 0.0, 0.0
+            else:
+                self.rotation_phase = True
+                if self.current_sequence == 1:
+                    flipped_target_theta = np.arctan2(np.sin(target_theta + np.pi), np.cos(target_theta + np.pi))
+                    angle_error = np.arctan2(np.sin(flipped_target_theta - theta), np.cos(flipped_target_theta - theta))
+                if abs(angle_error) > 0.02:
+                    v = 0.0
+                    w = Kp_w * angle_error
+                else:
+                    v, w = 0.0, 0.0
         else:
             e_x = p_xg - p_xl
             e_y = p_yg - p_yl
@@ -195,11 +198,12 @@ def main(args=None):
     parser.add_argument('--robot_id', type=int, required=True, help='ID of the robot to control')
     parser.add_argument('--pass_to_robot', type=int, default=0, help='ID of ally robot to pass to (0 for goal)')
     parser.add_argument('--mock_mode', action='store_true', help='Enable mock mode for testing without real VRPN data')
-    
+    parser.add_argument('--orient_to_stick', action='store_true', help='Enable terminal angle orientation alignment for the hockey stick')
+
     args, remaining = parser.parse_known_args(args)
     rclpy.init(args=remaining)
     
-    node = Robot(robot_id=args.robot_id, pass_to_robot=args.pass_to_robot, mock_mode=args.mock_mode)
+    node = Robot(robot_id=args.robot_id, pass_to_robot=args.pass_to_robot, mock_mode=args.mock_mode, orient_to_stick=args.orient_to_stick)
     executor = MultiThreadedExecutor()
     executor.add_node(node)
     try:
