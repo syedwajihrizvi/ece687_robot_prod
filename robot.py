@@ -214,7 +214,7 @@ class Robot(Node):
                 self.get_logger().info("Sequence 4: Moving backwards for 5 seconds...")
             elapsed_time = (now - self.state_start_time).nanoseconds / 1e9
             if elapsed_time < 5.0:
-                cmd.linear.x = -0.15
+                cmd.linear.x = -1.0
                 self.get_logger().info(f"Sequence 4: Moving backwards. Elapsed time: {elapsed_time:.2f}s", throttle_duration_sec=1.0)
                 self.pub_cmd_vel.publish(cmd)
             else:
