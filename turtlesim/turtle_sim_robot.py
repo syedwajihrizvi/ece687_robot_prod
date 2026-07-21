@@ -2,13 +2,35 @@ import argparse
 import math
 import numpy as np
 import rclpy
+from enum import Enum
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy
 from geometry_msgs.msg import Twist, PoseStamped
 from turtlesim.msg import Pose
 
+"""
+Following Sequences:
+0: OPEN_GRIPPER (Mock print 2s)
+1: MOVE_TO_STICK (3-stage standoff approach)
+2: CLOSE_GRIPPER (Mock print 2s)
+3: LIFT_STICK (Mock print 2s)
+4: MOVE_BACK_ROTATE (Timed reverse 5s)
+5: MOVE_TO_PUCK (2-stage approach)
+6: LOWER_STICK (Mock print 2s)
+7: RELEASE_PUCK (Mock print 2s)
+"""
+class Sequence(Enum):
+    OPEN_GRIPPER = 0
+    MOVE_TO_STICK = 1
+    CLOSE_GRIPPER = 2
+    LIFT_STICK = 3
+    MOVE_BACK_ROTATE = 4
+    MOVE_TO_PUCK = 5
+    LOWER_STICK = 6
+    RELEASE_PUCK = 7
+
 class TurtlesimSequenceController(Node):
-    def __init__(self, pass_to_robot, l_default=0.15, tolerance_default=0.15, standoff_distance=2.5):
+    def __init__(self, pass_to_robot, l_default=0.15, tolerance_default=0.15, standoff_distance=2.5, sideways_offset=0.0, vertical_offset=0.0):
         super().__init__('turtlesim_sequence_controller')
         self.pass_to_robot = pass_to_robot
 
@@ -20,17 +42,11 @@ class TurtlesimSequenceController(Node):
         self.current_target_pose = None
         self.state_start_time = None
         
-        # Internal sub-stages tracker for Sequence 1: 
-        # 0: Turn to face standoff, 
-        # 1: Drive to standoff, 
-        # 2: Rotate to target orientation, 
-        # 3: Final translation
+        # Internal sub-stages tracker for Sequence.MOVE_TO_STICK
         self.seq1_stage = 0 
         self.seq1_completed = False 
 
-        # Internal sub-stages tracker for Sequence 4:
-        # 0: Drive directly to target, 
-        # 1: Align heading angle with target
+        # Internal sub-stages tracker for Sequence.MOVE_TO_PUCK
         self.seq4_stage = 0
         self.seq4_completed = False
 
@@ -39,11 +55,15 @@ class TurtlesimSequenceController(Node):
         self.declare_parameter('kp_w', 1.7) 
         self.declare_parameter('l', l_default)
         self.declare_parameter('tolerance', tolerance_default)
-        self.declare_parameter('standoff_distance', standoff_distance) # Linear distance extension along same angle
+        self.declare_parameter('standoff_distance', standoff_distance)
+        self.declare_parameter('sideways_offset', sideways_offset)
+        self.declare_parameter('vertical_offset', vertical_offset)
+        self.declare_parameter('start_sequence', 0)
         
-        self.current_sequence = 1
+        # Safely cast parameter to Enum member
+        self.current_sequence = Sequence(self.get_parameter('start_sequence').value)
 
-        self.L_inv = np.array([[1, 0], [0, 1/self.get_parameter('l').value]])
+        self.L_inv = np.array([[1, 0], [0, 1 / self.get_parameter('l').value]])
         
         self.timer = self.create_timer(0.1, self.control_loop)
         qos_pose = QoSProfile(reliability=ReliabilityPolicy.BEST_EFFORT, depth=10)
@@ -54,7 +74,15 @@ class TurtlesimSequenceController(Node):
         
         self.create_subscription(Pose, '/turtle1/pose', self.turtlesim_pose_callback, qos_pose)
         self.pub_cmd_vel = self.create_publisher(Twist, '/turtle1/cmd_vel', 10)
-        self.get_logger().info("Turtlesim Sequence State Machine fully booted up at sequence: 1")
+        self.get_logger().info(f"Turtlesim Sequence State Machine booted up at state: {self.current_sequence.name}")
+
+    def advance_sequence(self):
+        """Advances state machine to the next Sequence enum member."""
+        next_val = self.current_sequence.value + 1
+        if next_val in [s.value for s in Sequence]:
+            self.current_sequence = Sequence(next_val)
+        else:
+            self.current_sequence = None  # Reached end of sequence pipeline
 
     def get_rotation_matrix(self, theta):
         return np.array([[np.cos(theta), -np.sin(theta)],
@@ -73,25 +101,40 @@ class TurtlesimSequenceController(Node):
         if self.robot_pose is None:
             self.get_logger().warn("Waiting for baseline Turtlesim telemetry...", throttle_duration_sec=2.0)
             return
+
+        now = self.get_clock().now()
+
+        # --- SEQUENCE 0: OPEN GRIPPER (MOCK PRINT FOR 2s) ---
+        if self.current_sequence == Sequence.OPEN_GRIPPER:
+            if self.state_start_time is None:
+                self.state_start_time = now
+                self.get_logger().info("[ACTION] Sequence 0: Opening gripper mechanism (2s)...")
             
-        # --- PHASE 1 & 4: SPATIAL TRACKING OVER DYNAMICS MOCKING ---
-        if self.current_sequence in [1, 4]:
-            self.current_target_pose = self.hockey_stick_pose if self.current_sequence == 1 else self.puck_pose
+            elapsed = (now - self.state_start_time).nanoseconds / 1e9
+            if elapsed < 2.0:
+                self.get_logger().info(f"[ACTION] Gripper opening... {elapsed:.1f}s", throttle_duration_sec=1.0)
+            else:
+                self.get_logger().info("[ACTION] Gripper open complete! Advancing to MOVE_TO_STICK.")
+                self.advance_sequence()
+                self.state_start_time = None
+
+        # --- SEQUENCE 1 & 5: SPATIAL TRACKING ---
+        elif self.current_sequence in [Sequence.MOVE_TO_STICK, Sequence.MOVE_TO_PUCK]:
+            self.current_target_pose = self.hockey_stick_pose if self.current_sequence == Sequence.MOVE_TO_STICK else self.puck_pose
             if self.current_target_pose is None:
-                self.get_logger().warn(f"Sequence {self.current_sequence}: Tracking assets missing from stream...", throttle_duration_sec=2.0)
+                self.get_logger().warn(f"Sequence {self.current_sequence.name}: Tracking assets missing from stream...", throttle_duration_sec=2.0)
                 return
 
             cmd = Twist()
             v, w = self.nid_kinematics()
 
-            # Ensure both sequences check their respective staged completion flags
             if v == 0.0 and w == 0.0 and (
-                (self.current_sequence == 1 and self.seq1_completed) or 
-                (self.current_sequence == 4 and self.seq4_completed)
+                (self.current_sequence == Sequence.MOVE_TO_STICK and self.seq1_completed) or
+                (self.current_sequence == Sequence.MOVE_TO_PUCK and self.seq4_completed)
             ):
                 self.pub_cmd_vel.publish(cmd)
-                self.get_logger().info(f"=== Sequence {self.current_sequence} Completed! ===")
-                self.current_sequence += 1
+                self.get_logger().info(f"=== Sequence {self.current_sequence.name} Completed! ===")
+                self.advance_sequence()
                 self.state_start_time = None
                 return
                 
@@ -99,43 +142,83 @@ class TurtlesimSequenceController(Node):
             cmd.angular.z = w
             self.pub_cmd_vel.publish(cmd)
 
-        # --- PHASE 2: GRIPPER ACTION ENGAGEMENT ---
-        elif self.current_sequence == 2:
-            self.pub_cmd_vel.publish(Twist()) 
-
+        # --- SEQUENCE 2: CLOSE GRIPPER (MOCK PRINT FOR 2s) ---
+        elif self.current_sequence == Sequence.CLOSE_GRIPPER:
+            self.pub_cmd_vel.publish(Twist()) # Lock position
             if self.state_start_time is None:
-                self.state_start_time = self.get_clock().now()
-                self.get_logger().info("[ACTION] Gripper engagement active. Processing manipulator tool lock (5s)...")
+                self.state_start_time = now
+                self.get_logger().info("[ACTION] Sequence 2: Closing gripper to lock hockey stick tool (2s)...")
 
-            elapsed = (self.get_clock().now() - self.state_start_time).nanoseconds / 1e9
-            if elapsed >= 5.0:
-                self.get_logger().info("Gripper operational seal established! Advancing to Sequence 3.")
-                self.current_sequence += 1
+            elapsed = (now - self.state_start_time).nanoseconds / 1e9
+            if elapsed < 2.0:
+                self.get_logger().info(f"[ACTION] Gripper closing... {elapsed:.1f}s", throttle_duration_sec=1.0)
+            else:
+                self.get_logger().info("[ACTION] Gripper secure lock established! Advancing to LIFT_STICK.")
+                self.advance_sequence()
                 self.state_start_time = None
 
-        # --- PHASE 3: TIMED SAFETY DISPLACEMENT (BACKWARD REVERSE) ---
-        elif self.current_sequence == 3:
+        # --- SEQUENCE 3: LIFT STICK (MOCK PRINT FOR 2s) ---
+        elif self.current_sequence == Sequence.LIFT_STICK:
+            if self.state_start_time is None:
+                self.state_start_time = now
+                self.get_logger().info("[ACTION] Sequence 3: Lifting stick off platform anchor (2s)...")
+
+            elapsed = (now - self.state_start_time).nanoseconds / 1e9
+            if elapsed < 2.0:
+                self.get_logger().info(f"[ACTION] Manipulator elevating stick... {elapsed:.1f}s", throttle_duration_sec=1.0)
+            else:
+                self.get_logger().info("[ACTION] Stick clear of platform ground plane! Advancing to MOVE_BACK_ROTATE.")
+                self.advance_sequence()
+                self.state_start_time = None
+
+        # --- SEQUENCE 4: TIMED SAFETY REVERSE DISPLACEMENT (5s) ---
+        elif self.current_sequence == Sequence.MOVE_BACK_ROTATE:
             cmd = Twist()
             if self.state_start_time is None:
-                self.state_start_time = self.get_clock().now()
-                self.get_logger().info("[ACTION] Executing timed step safety clearance backwards (5s)...")
+                self.state_start_time = now
+                self.get_logger().info("[ACTION] Sequence 4: Executing reverse safety clearance step (5s)...")
 
-            elapsed = (self.get_clock().now() - self.state_start_time).nanoseconds / 1e9
+            elapsed = (now - self.state_start_time).nanoseconds / 1e9
             if elapsed < 5.0:
-                cmd.linear.x = -0.75
+                cmd.linear.x = -0.15 # Reverse velocity
+                self.get_logger().info(f"[ACTION] Backing away... {elapsed:.1f}s", throttle_duration_sec=1.0)
                 self.pub_cmd_vel.publish(cmd)
             else:
-                self.get_logger().info("Reverse clearance buffer established! Advancing to Sequence 4 (Target: Puck).")
-                self.current_sequence += 1
+                self.get_logger().info("[ACTION] Reverse clearance buffer set! Advancing to MOVE_TO_PUCK.")
+                self.advance_sequence()
                 self.state_start_time = None
 
-        # --- PHASE 5: PUCK STRIKE / PASS TRANSITION ---
-        elif self.current_sequence == 5:
+        # --- SEQUENCE 6: LOWER STICK TO GROUND (MOCK PRINT FOR 2s) ---
+        elif self.current_sequence == Sequence.LOWER_STICK:
+            if self.state_start_time is None:
+                self.state_start_time = now
+                self.get_logger().info("[ACTION] Sequence 6: Lowering stick onto field ice surface (2s)...")
+
+            elapsed = (now - self.state_start_time).nanoseconds / 1e9
+            if elapsed < 2.0:
+                self.get_logger().info(f"[ACTION] Lowering tool assembly... {elapsed:.1f}s", throttle_duration_sec=1.0)
+            else:
+                self.get_logger().info("[ACTION] Stick in strike posture on ground level! Advancing to RELEASE_PUCK.")
+                self.advance_sequence()
+                self.state_start_time = None
+
+        # --- SEQUENCE 7: RELEASE / SHOOT PUCK (MOCK PRINT FOR 2s) ---
+        elif self.current_sequence == Sequence.RELEASE_PUCK:
             dest = f"Robot {self.pass_to_robot}" if self.pass_to_robot else "the field goal"
-            self.get_logger().info(f"[SHOOT] Kinetic impulse executed! Projecting puck toward {dest}.")
-            self.current_sequence += 1
+            if self.state_start_time is None:
+                self.state_start_time = now
+                self.get_logger().info(f"[SHOOT] Sequence 7: Executing kinetic stroke toward {dest} (2s)...")
+
+            elapsed = (now - self.state_start_time).nanoseconds / 1e9
+            if elapsed < 2.0:
+                self.get_logger().info(f"[SHOOT] Kinetic force transfer active... {elapsed:.1f}s", throttle_duration_sec=1.0)
+            else:
+                self.get_logger().info(f"[SHOOT] Puck released toward {dest}! Execution sequence finished.")
+                self.advance_sequence()
+                self.state_start_time = None
+
         else:
-            self.get_logger().info("All sequences completed. Robot is now idle.")
+            self.get_logger().info("All sequences completed. Robot is idle.", throttle_duration_sec=3.0)
             self.pub_cmd_vel.publish(Twist())
 
     def nid_kinematics(self):
@@ -159,10 +242,15 @@ class TurtlesimSequenceController(Node):
 
         v, w = 0.0, 0.0
 
-        # --- UNIVERSAL MANEUVER STAGING FOR SEQUENCE 1 ---
-        if self.current_sequence == 1:
-            standoff_x = p_xg + standoff_dist * math.cos(target_theta)
-            standoff_y = p_yg + standoff_dist * math.sin(target_theta)
+        # --- STAGED APPROACH FOR MOVE_TO_STICK ---
+        if self.current_sequence == Sequence.MOVE_TO_STICK:
+            # Apply static (x, y) translations
+            target_x = p_xg + self.get_parameter('vertical_offset').value
+            target_y = p_yg + self.get_parameter('sideways_offset').value
+
+            # Calculate standoff point vector
+            standoff_x = target_x + standoff_dist * math.cos(target_theta)
+            standoff_y = target_y + standoff_dist * math.sin(target_theta)
 
             if self.seq1_stage == 0:
                 bearing_to_standoff = np.arctan2(standoff_y - p_yl, standoff_x - p_xl)
@@ -179,10 +267,11 @@ class TurtlesimSequenceController(Node):
                 dist = np.sqrt((standoff_x - p_xl)**2 + (standoff_y - p_yl)**2)
                 if dist <= tolerance:
                     self.seq1_stage = 2
-                    self.get_logger().info("[Seq 1 - Stage 1] Arrived at offset location. Advancing to Stage 2 (Orientation).")
+                    self.get_logger().info("[Seq 1 - Stage 1] Arrived at standoff location. Advancing to Stage 2 (Orientation).")
                 else:
                     e_x, e_y = standoff_x - p_xl, standoff_y - p_yl
                     p_dot_x, p_dot_y = Kp_v * e_x, Kp_v * e_y
+                    self.L_inv[1, 1] = 1.0 / l
                     control_inputs = self.L_inv @ self.get_rotation_matrix(theta).transpose() @ np.array([[p_dot_x], [p_dot_y]])
                     return float(control_inputs[0, 0]), float(control_inputs[1, 0])
 
@@ -198,41 +287,42 @@ class TurtlesimSequenceController(Node):
                     self.get_logger().info("[Seq 1 - Stage 2] Alignment complete! Advancing to Stage 3 (Final Move).")
 
             if self.seq1_stage == 3:
-                dist = np.sqrt((p_xg - p_xl)**2 + (p_yg - p_yl)**2)
+                dist = np.sqrt((target_x - p_xl)**2 + (target_y - p_yl)**2)
                 if dist <= tolerance:
                     self.seq1_completed = True 
                     return 0.0, 0.0  
                 else:
-                    e_x, e_y = p_xg - p_xl, p_yg - p_yl
+                    e_x, e_y = target_x - p_xl, target_y - p_yl
                     p_dot_x, p_dot_y = Kp_v * e_x, Kp_v * e_y
+                    self.L_inv[1, 1] = 1.0 / l
                     control_inputs = self.L_inv @ self.get_rotation_matrix(theta).transpose() @ np.array([[p_dot_x], [p_dot_y]])
                     return float(control_inputs[0, 0]), float(control_inputs[1, 0])
 
-        # --- STAGED MANEUVER FOR SEQUENCE 4 ---
-        elif self.current_sequence == 4:
+        # --- STAGED APPROACH FOR MOVE_TO_PUCK ---
+        elif self.current_sequence == Sequence.MOVE_TO_PUCK:
             if self.seq4_stage == 0:
-                # Stage 4.0: Drive directly to the target point
                 distance_to_target = np.sqrt((p_xg - p_xl)**2 + (p_yg - p_yl)**2)
                 if distance_to_target <= tolerance:
                     self.seq4_stage = 1
-                    self.get_logger().info("[Seq 4 - Stage 0] Arrived at target point. Advancing to Stage 1 (Orientation Alignment).")
+                    self.get_logger().info("[Seq 5 - Stage 0] Arrived at puck location. Advancing to Stage 1 (Orientation Alignment).")
                     return 0.0, 0.0
                 else:
                     e_x, e_y = p_xg - p_xl, p_yg - p_yl
                     p_dot_x, p_dot_y = Kp_v * e_x, Kp_v * e_y
+                    self.L_inv[1, 1] = 1.0 / l
                     control_inputs = self.L_inv @ self.get_rotation_matrix(theta).transpose() @ np.array([[p_dot_x], [p_dot_y]])
                     return float(control_inputs[0, 0]), float(control_inputs[1, 0])
+            
             if self.seq4_stage == 1:
-                # Stage 4.1: Align angle with the target orientation
                 angle_error = np.arctan2(np.sin(target_theta - theta), np.cos(target_theta - theta))
                 if abs(angle_error) > 0.02:
                     w = Kp_w * angle_error
                     return 0.0, float(w)
                 else:
                     self.seq4_completed = True
-                    self.get_logger().info("[Seq 4 - Stage 1] Orientation alignment complete!")
+                    self.get_logger().info("[Seq 5 - Stage 1] Puck orientation alignment complete!")
                     return 0.0, 0.0
-                    
+
         return 0.0, 0.0
 
 def main(args=None):
@@ -241,6 +331,8 @@ def main(args=None):
     parser.add_argument('--l', type=float, default=0.15, help='Look-ahead center distance')
     parser.add_argument('--tolerance', type=float, default=0.15, help='Target proximity threshold radius')
     parser.add_argument('--standoff_distance', type=float, default=2.5, help='Linear projection offset along the vector field line')
+    parser.add_argument('--sideways_offset', type=float, default=0.0, help="Sideways offset for hockeystick pose")
+    parser.add_argument('--vertical_offset', type=float, default=0.0, help="Vertical offset for hockeystick pose")
     
     args, remaining = parser.parse_known_args(args)
     rclpy.init(args=remaining)
@@ -249,7 +341,9 @@ def main(args=None):
         pass_to_robot=args.pass_to_robot,
         l_default=args.l,
         tolerance_default=args.tolerance,
-        standoff_distance=args.standoff_distance
+        standoff_distance=args.standoff_distance,
+        sideways_offset=args.sideways_offset,
+        vertical_offset=args.vertical_offset
     )
     
     try:
