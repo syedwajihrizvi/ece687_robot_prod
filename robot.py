@@ -8,29 +8,33 @@ from rclpy.action import ActionClient
 from rclpy.qos import QoSProfile, ReliabilityPolicy
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.callback_groups import ReentrantCallbackGroup
-from robomaster_msgs.action import GripperControl
+from robomaster_msgs.action import GripperControl, MoveArm
 from geometry_msgs.msg import Twist, PoseStamped, Vector3
 
 """
 Following Sequences
 0: Open Gripper
-1: Move to Hockey Stick
-2: Close Gripper
-3: Lift Stick in the Air to remove from platform
-4: Move Backwards and Rotate
-5: Move to Puck
-6: Bring Stick to the Ground
-7: Release Puck
+1: Move Arm to Origin Position (0.0, 0.0)
+2: Move Arm to Reference Position (0.15, 0.15)
+3: Move to Hockey Stick
+4: Close Gripper
+5: Lift Stick in the Air to remove from platform
+6: Move Backwards and Rotate
+7: Move to Puck
+8: Bring Stick to the Ground
+9: Release Puck
 """
 class Sequence(Enum):
     OPEN_GRIPPER = 0
-    MOVE_TO_STICK = 1
-    CLOSE_GRIPPER = 2
-    LIFT_STICK = 3
-    MOVE_BACK_ROTATE = 4
-    MOVE_TO_PUCK = 5
-    LOWER_STICK = 6
-    RELEASE_PUCK = 7
+    MOVE_EE_TO_ORIGIN = 1
+    MOVE_EE_TO_REF_POS = 2
+    MOVE_TO_STICK = 3
+    CLOSE_GRIPPER = 4
+    LIFT_STICK = 5
+    MOVE_BACK_ROTATE = 6
+    MOVE_TO_PUCK = 7
+    LOWER_STICK = 8
+    RELEASE_PUCK = 9
 
 class Robot(Node):
     def __init__(self, 
@@ -49,13 +53,17 @@ class Robot(Node):
         self.robot_id = robot_id
         self.robot_name = f'/robot{robot_id}'
         self.gripper_action = f'/robot{robot_id}/gripper'
+        self.arm_action = f'/robot{robot_id}/arm'
         self.pass_to_robot = pass_to_robot
         self.hockey_stick_id = hockey_stick_id
         self.puck_color = puck_color
         self.mock_mode = mock_mode
         self.orient_to_stick = orient_to_stick
+        
+        # Action tracking flags
         self.gripper_action_running = False
-        self.gripper_action_accepted = False
+        self.arm_action_running = False
+        
         self.robot_pose = None
         self.hockey_stick_pose = None
         self.puck_pose = None
@@ -84,6 +92,7 @@ class Robot(Node):
         self.L_inv = np.array([[1, 0], [0, 1/self.get_parameter('l').value]])
         self._action_group = ReentrantCallbackGroup()
         self.gripper_action_client = None
+        self.arm_action_client = None
         if not self.mock_mode:
             self.gripper_action_client = ActionClient(
                 self,
@@ -94,6 +103,17 @@ class Robot(Node):
             self.get_logger().info("Waiting for gripper action server...")
             self.gripper_action_client.wait_for_server()
             self.get_logger().info("Gripper action server is available.")
+            
+            self.arm_action_client = ActionClient(
+                self,
+                MoveArm,
+                self.arm_action,
+                callback_group=self._action_group
+            )
+            self.get_logger().info("Waiting for arm action server...")
+            self.arm_action_client.wait_for_server()
+            self.get_logger().info("Arm action server is available.")
+
         time_period = 1.0 / self.get_parameter('control_frequency').value
         self.timer = self.create_timer(time_period, self.control_loop)
         qos = QoSProfile(reliability=ReliabilityPolicy.BEST_EFFORT, depth=10)
@@ -108,7 +128,6 @@ class Robot(Node):
             self.create_subscription(PoseStamped, f'/vrpn_mocap/hockey_puck_{self.puck_color}/pose', self.puck_pos_callback, qos)
             
         self.pub_cmd_vel = self.create_publisher(Twist, f'{self.robot_name}/cmd_vel', 10)
-        # Fixed topic publisher message type to match Vector3 payload
         self.pub_cmd_arm = self.create_publisher(Vector3, f'{self.robot_name}/cmd_arm', 10)
         self.get_logger().info(f'Robot node initialized at sequence state: {self.current_sequence.name} with stick ID: {self.hockey_stick_id} & puck color: {self.puck_color}')
 
@@ -144,6 +163,7 @@ class Robot(Node):
 
         now = self.get_clock().now()
 
+        # Rule 1, 2, 3: Open Gripper Action
         if self.current_sequence == Sequence.OPEN_GRIPPER:
             if self.state_start_time is None:
                 elapsed_retry_time = 3.0 
@@ -154,6 +174,30 @@ class Robot(Node):
                 self.state_start_time = now 
                 self.gripper_action_running = True
                 self.gripper_controller(open=True)
+
+        # Rule 1, 2, 3: Move Arm to Origin Action (0.0, 0.0)
+        elif self.current_sequence == Sequence.MOVE_EE_TO_ORIGIN:
+            if self.state_start_time is None:
+                elapsed_retry_time = 3.0
+            else:
+                elapsed_retry_time = (now - self.state_start_time).nanoseconds / 1e9
+            if elapsed_retry_time >= 3.0 and not self.arm_action_running:
+                self.get_logger().info("Sequence 1: Dispatching arm move to origin request...")
+                self.state_start_time = now 
+                self.arm_action_running = True
+                self.move_arm_using_action(x=0.0, z=0.0, relative=False)
+
+        # Rule 1, 2, 3: Move Arm to Ref Pos Action (0.15, 0.15)
+        elif self.current_sequence == Sequence.MOVE_EE_TO_REF_POS:
+            if self.state_start_time is None:
+                elapsed_retry_time = 3.0
+            else:
+                elapsed_retry_time = (now - self.state_start_time).nanoseconds / 1e9
+            if elapsed_retry_time >= 3.0 and not self.arm_action_running:
+                self.get_logger().info("Sequence 2: Dispatching arm move to reference position request...")
+                self.state_start_time = now 
+                self.arm_action_running = True
+                self.move_arm_using_action(x=0.15, z=0.15, relative=False)
 
         elif self.current_sequence in [Sequence.MOVE_TO_STICK, Sequence.MOVE_TO_PUCK]:
             self.current_target_pose = self.hockey_stick_pose if self.current_sequence == Sequence.MOVE_TO_STICK else self.puck_pose
@@ -179,7 +223,8 @@ class Robot(Node):
             cmd.angular.z = w
             self.get_logger().info(f"Sequence {self.current_sequence.name}: v={v:.3f}, w={w:.3f}", throttle_duration_sec=1.0)
             self.pub_cmd_vel.publish(cmd)
-                
+
+        # Rule 1, 2, 3: Close Gripper Action
         elif self.current_sequence == Sequence.CLOSE_GRIPPER:
             self.pub_cmd_vel.publish(Twist()) 
             if self.state_start_time is None:
@@ -188,7 +233,7 @@ class Robot(Node):
                 elapsed_retry_time = (now - self.state_start_time).nanoseconds / 1e9
 
             if elapsed_retry_time >= 3.0 and not self.gripper_action_running:
-                self.get_logger().info(f"Sequence 2: Dispatching gripper CLOSE request... (Running: {self.gripper_action_running})")
+                self.get_logger().info(f"Sequence 4: Dispatching gripper CLOSE request... (Running: {self.gripper_action_running})")
                 self.state_start_time = now 
                 self.gripper_action_running = True
                 self.gripper_controller(open=False) 
@@ -196,50 +241,51 @@ class Robot(Node):
         elif self.current_sequence == Sequence.LIFT_STICK:
             if self.state_start_time is None:
                 self.state_start_time = now
-                self.get_logger().info("Sequence 3: Dispatching arm LIFT command (waiting 2s)...")
+                self.get_logger().info("Sequence 5: Dispatching arm LIFT command (waiting 2s)...")
                 self.arm_controller(direction=1)
 
             elapsed_time = (now - self.state_start_time).nanoseconds / 1e9
             if elapsed_time >= 2.0:
-                self.get_logger().info("Sequence 3: Arm lift complete! Advancing sequence.")
+                self.get_logger().info("Sequence 5: Arm lift complete! Advancing sequence.")
                 self.state_start_time = None
                 self.advance_sequence()
             else:
-                self.get_logger().info(f"Sequence 3: Lifting stick... {elapsed_time:.1f}s", throttle_duration_sec=1.0)
+                self.get_logger().info(f"Sequence 5: Lifting stick... {elapsed_time:.1f}s", throttle_duration_sec=1.0)
 
         elif self.current_sequence == Sequence.MOVE_BACK_ROTATE:
             cmd = Twist()
             if self.state_start_time is None:
                 self.state_start_time = now
-                self.get_logger().info("Sequence 4: Moving backwards for 5 seconds...")
+                self.get_logger().info("Sequence 6: Moving backwards for 5 seconds...")
             elapsed_time = (now - self.state_start_time).nanoseconds / 1e9
             if elapsed_time < 5.0:
-                cmd.linear.x = -1.0
-                self.get_logger().info(f"Sequence 4: Moving backwards. Elapsed time: {elapsed_time:.2f}s", throttle_duration_sec=1.0)
+                cmd.linear.x = -0.15
+                self.get_logger().info(f"Sequence 6: Moving backwards. Elapsed time: {elapsed_time:.2f}s", throttle_duration_sec=1.0)
                 self.pub_cmd_vel.publish(cmd)
             else:
-                self.get_logger().info("Sequence 4 completed. Advancing to Sequence 5.")
+                self.get_logger().info("Sequence 6 completed. Advancing to Sequence 7.")
                 self.advance_sequence()
                 self.state_start_time = None
 
         elif self.current_sequence == Sequence.LOWER_STICK:
             if self.state_start_time is None:
                 self.state_start_time = now
-                self.get_logger().info("Sequence 6: Dispatching arm LOWER command (waiting 2s)...")
+                self.get_logger().info("Sequence 8: Dispatching arm LOWER command (waiting 2s)...")
                 self.arm_controller(direction=-1)
 
             elapsed_time = (now - self.state_start_time).nanoseconds / 1e9
             if elapsed_time >= 2.0:
-                self.get_logger().info("Sequence 6: Arm lower complete! Advancing sequence.")
+                self.get_logger().info("Sequence 8: Arm lower complete! Advancing sequence.")
                 self.state_start_time = None
                 self.advance_sequence()
             else:
-                self.get_logger().info(f"Sequence 6: Lowering stick... {elapsed_time:.1f}s", throttle_duration_sec=1.0)
+                self.get_logger().info(f"Sequence 8: Lowering stick... {elapsed_time:.1f}s", throttle_duration_sec=1.0)
 
         elif self.current_sequence == Sequence.RELEASE_PUCK:
+            self.get_logger().info("Sequence 9: Releasing puck.")
             self.release_puck()
             self.advance_sequence()
-        
+
         else:
             self.get_logger().info("All sequences completed. Robot is now idle.", throttle_duration_sec=3.0)
             self.pub_cmd_vel.publish(Twist())
@@ -282,13 +328,13 @@ class Robot(Node):
                     return 0.0, float(w)
                 else:
                     self.seq1_stage = 1
-                    self.get_logger().info("[Seq 1 - Stage 0] Heading aligned to standoff vector. Advancing to Stage 1.")
+                    self.get_logger().info("[Seq 3 - Stage 0] Heading aligned to standoff vector. Advancing to Stage 1.")
 
             if self.seq1_stage == 1:
                 dist = np.sqrt((standoff_x - p_xl)**2 + (standoff_y - p_yl)**2)
                 if dist <= tolerance:
                     self.seq1_stage = 2
-                    self.get_logger().info("[Seq 1 - Stage 1] Arrived at standoff location. Advancing to Stage 2 (Orientation).")
+                    self.get_logger().info("[Seq 3 - Stage 1] Arrived at standoff location. Advancing to Stage 2 (Orientation).")
                 else:
                     e_x, e_y = standoff_x - p_xl, standoff_y - p_yl
                     p_dot_x, p_dot_y = Kp_v * e_x, Kp_v * e_y
@@ -305,7 +351,7 @@ class Robot(Node):
                     return 0.0, float(w)
                 else:
                     self.seq1_stage = 3
-                    self.get_logger().info("[Seq 1 - Stage 2] Alignment complete! Advancing to Stage 3 (Final Move).")
+                    self.get_logger().info("[Seq 3 - Stage 2] Alignment complete! Advancing to Stage 3 (Final Move).")
 
             if self.seq1_stage == 3:
                 dist = np.sqrt((target_x - p_xl)**2 + (target_y - p_yl)**2)
@@ -325,7 +371,7 @@ class Robot(Node):
                 distance_to_target = np.sqrt((p_xg - p_xl)**2 + (p_yg - p_yl)**2)
                 if distance_to_target <= tolerance:
                     self.seq4_stage = 1
-                    self.get_logger().info("[Seq 5 - Stage 0] Arrived at puck location. Advancing to Stage 1 (Orientation Alignment).")
+                    self.get_logger().info("[Seq 7 - Stage 0] Arrived at puck location. Advancing to Stage 1 (Orientation Alignment).")
                     return 0.0, 0.0
                 else:
                     e_x, e_y = p_xg - p_xl, p_yg - p_yl
@@ -341,7 +387,7 @@ class Robot(Node):
                     return 0.0, float(w)
                 else:
                     self.seq4_completed = True
-                    self.get_logger().info("[Seq 5 - Stage 1] Puck orientation alignment complete!")
+                    self.get_logger().info("[Seq 7 - Stage 1] Puck orientation alignment complete!")
                     return 0.0, 0.0
 
         return 0.0, 0.0
@@ -350,19 +396,35 @@ class Robot(Node):
         if self.mock_mode:
             self.get_logger().info(f"Mock mode active: {'Opening' if open else 'Closing'} gripper simulated.")
             self.gripper_action_running = False
+            self.state_start_time = None
             self.advance_sequence()
             return
-        self.get_logger().info("Gripper Operation running to pick up the stick...") 
+        self.get_logger().info("Gripper Operation running...") 
         goal = GripperControl.Goal()
-        self.power = 1
         goal.target_state = 1 if open else 2
         future = self.gripper_action_client.send_goal_async(goal)
-        self.get_logger().info("Goal has been sent")
+        self.get_logger().info("Gripper goal request dispatched.")
         future.add_done_callback(self._goal_response_cb)
+
+    def move_arm_using_action(self, x, z, relative=False):
+        if self.mock_mode:
+            self.get_logger().info(f"Mock mode active: Arm move to ({x}, {z}) simulated.")
+            self.arm_action_running = False
+            self.state_start_time = None
+            self.advance_sequence()
+            return
+        self.get_logger().info(f"Moving arm to pose ({x}, {z})...")
+        goal = MoveArm.Goal()
+        goal.x = x
+        goal.z = z
+        goal.relative = relative
+        future = self.arm_action_client.send_goal_async(goal)
+        self.get_logger().info("Sending arm move goal request...")
+        future.add_done_callback(self._arm_goal_response_cb)
 
     def arm_controller(self, direction=1):
         """
-        Either move the arm up (direction=1) or down (direction=-1) by publishing a Vector3 message to the cmd_arm topic.
+        Move the arm up (direction=1) or down (direction=-1) via velocity payload.
         """
         if self.mock_mode:
             self.get_logger().info(f"Mock mode active: Arm {'lifting' if direction == 1 else 'lowering'} simulated.")
@@ -374,24 +436,45 @@ class Robot(Node):
 
     def _goal_response_cb(self, future):
         goal_handle = future.result()
-        self.get_logger().info(f"Goal Handle Result: {goal_handle}")
+        self.get_logger().info(f"Gripper Goal Handle Result: {goal_handle}")
         if not goal_handle.accepted:
-            self.get_logger().warn("Goal Client rejected by server! Resetting flag for retry...")
+            self.get_logger().warn("Gripper Goal rejected by server! Will retry after cooldown...")
             self.gripper_action_running = False 
             return
-        self.get_logger().info("Goal accepted by server. Awaiting execution result...")
+        self.get_logger().info("Gripper Goal accepted by server. Awaiting execution result...")
         goal_handle.get_result_async().add_done_callback(self._result_cb)
+
+    def _arm_goal_response_cb(self, future):
+        goal_handle = future.result()
+        self.get_logger().info(f"Arm Goal Handle Result: {goal_handle}")
+        if not goal_handle.accepted:
+            self.get_logger().warn("Arm Goal rejected by server! Will retry after cooldown...")
+            self.arm_action_running = False 
+            return
+        self.get_logger().info("Arm Goal accepted by server. Awaiting execution result...")
+        goal_handle.get_result_async().add_done_callback(self._arm_result_cb)
 
     def _result_cb(self, future):
         try:
             result = future.result()
-            self.advance_sequence()
             self.get_logger().info(f'Gripper operation succeeded. Moving to Sequence {self.current_sequence.name}')
+            self.advance_sequence()
         except Exception as e:
-            self.get_logger().error(f'Gripper execution tracking faulted: {e}. Will retry...')
+            self.get_logger().error(f'Gripper execution tracking faulted: {e}. Retrying...')
         finally:
             self.gripper_action_running = False
             self.state_start_time = None 
+
+    def _arm_result_cb(self, future):
+        try:
+            result = future.result()
+            self.get_logger().info(f'Arm operation succeeded. Moving to Sequence {self.current_sequence.name}')
+            self.advance_sequence()
+        except Exception as e:
+            self.get_logger().error(f'Arm execution tracking faulted: {e}. Retrying...')
+        finally:
+            self.arm_action_running = False
+            self.state_start_time = None
 
     def release_puck(self):
         dest = f"Robot {self.pass_to_robot}" if self.pass_to_robot else "the goal"

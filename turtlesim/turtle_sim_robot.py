@@ -11,23 +11,27 @@ from turtlesim.msg import Pose
 """
 Following Sequences:
 0: OPEN_GRIPPER (Mock print 2s)
-1: MOVE_TO_STICK (3-stage standoff approach)
-2: CLOSE_GRIPPER (Mock print 2s)
-3: LIFT_STICK (Mock print 2s)
-4: MOVE_BACK_ROTATE (Timed reverse 5s)
-5: MOVE_TO_PUCK (2-stage approach)
-6: LOWER_STICK (Mock print 2s)
-7: RELEASE_PUCK (Mock print 2s)
+1: MOVE_EE_TO_ORIGIN (Mock print 2s)
+2: MOVE_EE_TO_REF_POS (Mock print 2s)
+3: MOVE_TO_STICK (3-stage standoff approach)
+4: CLOSE_GRIPPER (Mock print 2s)
+5: LIFT_STICK (Mock print 2s)
+6: MOVE_BACK_ROTATE (Timed reverse 5s)
+7: MOVE_TO_PUCK (2-stage approach)
+8: LOWER_STICK (Mock print 2s)
+9: RELEASE_PUCK (Mock print 2s)
 """
 class Sequence(Enum):
     OPEN_GRIPPER = 0
-    MOVE_TO_STICK = 1
-    CLOSE_GRIPPER = 2
-    LIFT_STICK = 3
-    MOVE_BACK_ROTATE = 4
-    MOVE_TO_PUCK = 5
-    LOWER_STICK = 6
-    RELEASE_PUCK = 7
+    MOVE_EE_TO_ORIGIN = 1
+    MOVE_EE_TO_REF_POS = 2
+    MOVE_TO_STICK = 3
+    CLOSE_GRIPPER = 4
+    LIFT_STICK = 5
+    MOVE_BACK_ROTATE = 6
+    MOVE_TO_PUCK = 7
+    LOWER_STICK = 8
+    RELEASE_PUCK = 9
 
 class TurtlesimSequenceController(Node):
     def __init__(self, pass_to_robot, l_default=0.15, tolerance_default=0.15, standoff_distance=2.5, sideways_offset=0.0, vertical_offset=0.0):
@@ -114,11 +118,39 @@ class TurtlesimSequenceController(Node):
             if elapsed < 2.0:
                 self.get_logger().info(f"[ACTION] Gripper opening... {elapsed:.1f}s", throttle_duration_sec=1.0)
             else:
-                self.get_logger().info("[ACTION] Gripper open complete! Advancing to MOVE_TO_STICK.")
+                self.get_logger().info("[ACTION] Gripper open complete! Advancing to MOVE_EE_TO_ORIGIN.")
                 self.advance_sequence()
                 self.state_start_time = None
 
-        # --- SEQUENCE 1 & 5: SPATIAL TRACKING ---
+        # --- SEQUENCE 1: MOVE EE TO ORIGIN (MOCK PRINT FOR 2s) ---
+        elif self.current_sequence == Sequence.MOVE_EE_TO_ORIGIN:
+            if self.state_start_time is None:
+                self.state_start_time = now
+                self.get_logger().info("[ACTION] Sequence 1: Moving arm EE to origin (0.0, 0.0) (2s)...")
+
+            elapsed = (now - self.state_start_time).nanoseconds / 1e9
+            if elapsed < 2.0:
+                self.get_logger().info(f"[ACTION] Arm homing to origin... {elapsed:.1f}s", throttle_duration_sec=1.0)
+            else:
+                self.get_logger().info("[ACTION] Arm origin pose reached! Advancing to MOVE_EE_TO_REF_POS.")
+                self.advance_sequence()
+                self.state_start_time = None
+
+        # --- SEQUENCE 2: MOVE EE TO REF POS (MOCK PRINT FOR 2s) ---
+        elif self.current_sequence == Sequence.MOVE_EE_TO_REF_POS:
+            if self.state_start_time is None:
+                self.state_start_time = now
+                self.get_logger().info("[ACTION] Sequence 2: Moving arm EE to reference position (0.15, 0.15) (2s)...")
+
+            elapsed = (now - self.state_start_time).nanoseconds / 1e9
+            if elapsed < 2.0:
+                self.get_logger().info(f"[ACTION] Arm moving to reference... {elapsed:.1f}s", throttle_duration_sec=1.0)
+            else:
+                self.get_logger().info("[ACTION] Arm reference pose reached! Advancing to MOVE_TO_STICK.")
+                self.advance_sequence()
+                self.state_start_time = None
+
+        # --- SEQUENCE 3 & 7: SPATIAL TRACKING ---
         elif self.current_sequence in [Sequence.MOVE_TO_STICK, Sequence.MOVE_TO_PUCK]:
             self.current_target_pose = self.hockey_stick_pose if self.current_sequence == Sequence.MOVE_TO_STICK else self.puck_pose
             if self.current_target_pose is None:
@@ -142,12 +174,12 @@ class TurtlesimSequenceController(Node):
             cmd.angular.z = w
             self.pub_cmd_vel.publish(cmd)
 
-        # --- SEQUENCE 2: CLOSE GRIPPER (MOCK PRINT FOR 2s) ---
+        # --- SEQUENCE 4: CLOSE GRIPPER (MOCK PRINT FOR 2s) ---
         elif self.current_sequence == Sequence.CLOSE_GRIPPER:
             self.pub_cmd_vel.publish(Twist()) # Lock position
             if self.state_start_time is None:
                 self.state_start_time = now
-                self.get_logger().info("[ACTION] Sequence 2: Closing gripper to lock hockey stick tool (2s)...")
+                self.get_logger().info("[ACTION] Sequence 4: Closing gripper to lock hockey stick tool (2s)...")
 
             elapsed = (now - self.state_start_time).nanoseconds / 1e9
             if elapsed < 2.0:
@@ -157,11 +189,11 @@ class TurtlesimSequenceController(Node):
                 self.advance_sequence()
                 self.state_start_time = None
 
-        # --- SEQUENCE 3: LIFT STICK (MOCK PRINT FOR 2s) ---
+        # --- SEQUENCE 5: LIFT STICK (MOCK PRINT FOR 2s) ---
         elif self.current_sequence == Sequence.LIFT_STICK:
             if self.state_start_time is None:
                 self.state_start_time = now
-                self.get_logger().info("[ACTION] Sequence 3: Lifting stick off platform anchor (2s)...")
+                self.get_logger().info("[ACTION] Sequence 5: Lifting stick off platform anchor (2s)...")
 
             elapsed = (now - self.state_start_time).nanoseconds / 1e9
             if elapsed < 2.0:
@@ -171,12 +203,12 @@ class TurtlesimSequenceController(Node):
                 self.advance_sequence()
                 self.state_start_time = None
 
-        # --- SEQUENCE 4: TIMED SAFETY REVERSE DISPLACEMENT (5s) ---
+        # --- SEQUENCE 6: TIMED SAFETY REVERSE DISPLACEMENT (5s) ---
         elif self.current_sequence == Sequence.MOVE_BACK_ROTATE:
             cmd = Twist()
             if self.state_start_time is None:
                 self.state_start_time = now
-                self.get_logger().info("[ACTION] Sequence 4: Executing reverse safety clearance step (5s)...")
+                self.get_logger().info("[ACTION] Sequence 6: Executing reverse safety clearance step (5s)...")
 
             elapsed = (now - self.state_start_time).nanoseconds / 1e9
             if elapsed < 5.0:
@@ -188,11 +220,11 @@ class TurtlesimSequenceController(Node):
                 self.advance_sequence()
                 self.state_start_time = None
 
-        # --- SEQUENCE 6: LOWER STICK TO GROUND (MOCK PRINT FOR 2s) ---
+        # --- SEQUENCE 8: LOWER STICK TO GROUND (MOCK PRINT FOR 2s) ---
         elif self.current_sequence == Sequence.LOWER_STICK:
             if self.state_start_time is None:
                 self.state_start_time = now
-                self.get_logger().info("[ACTION] Sequence 6: Lowering stick onto field ice surface (2s)...")
+                self.get_logger().info("[ACTION] Sequence 8: Lowering stick onto field ice surface (2s)...")
 
             elapsed = (now - self.state_start_time).nanoseconds / 1e9
             if elapsed < 2.0:
@@ -202,12 +234,12 @@ class TurtlesimSequenceController(Node):
                 self.advance_sequence()
                 self.state_start_time = None
 
-        # --- SEQUENCE 7: RELEASE / SHOOT PUCK (MOCK PRINT FOR 2s) ---
+        # --- SEQUENCE 9: RELEASE / SHOOT PUCK (MOCK PRINT FOR 2s) ---
         elif self.current_sequence == Sequence.RELEASE_PUCK:
             dest = f"Robot {self.pass_to_robot}" if self.pass_to_robot else "the field goal"
             if self.state_start_time is None:
                 self.state_start_time = now
-                self.get_logger().info(f"[SHOOT] Sequence 7: Executing kinetic stroke toward {dest} (2s)...")
+                self.get_logger().info(f"[SHOOT] Sequence 9: Executing kinetic stroke toward {dest} (2s)...")
 
             elapsed = (now - self.state_start_time).nanoseconds / 1e9
             if elapsed < 2.0:
@@ -261,13 +293,13 @@ class TurtlesimSequenceController(Node):
                     return 0.0, float(w)
                 else:
                     self.seq1_stage = 1
-                    self.get_logger().info("[Seq 1 - Stage 0] Heading aligned to standoff vector. Advancing to Stage 1.")
+                    self.get_logger().info("[Seq 3 - Stage 0] Heading aligned to standoff vector. Advancing to Stage 1.")
 
             if self.seq1_stage == 1:
                 dist = np.sqrt((standoff_x - p_xl)**2 + (standoff_y - p_yl)**2)
                 if dist <= tolerance:
                     self.seq1_stage = 2
-                    self.get_logger().info("[Seq 1 - Stage 1] Arrived at standoff location. Advancing to Stage 2 (Orientation).")
+                    self.get_logger().info("[Seq 3 - Stage 1] Arrived at standoff location. Advancing to Stage 2 (Orientation).")
                 else:
                     e_x, e_y = standoff_x - p_xl, standoff_y - p_yl
                     p_dot_x, p_dot_y = Kp_v * e_x, Kp_v * e_y
@@ -284,7 +316,7 @@ class TurtlesimSequenceController(Node):
                     return 0.0, float(w)
                 else:
                     self.seq1_stage = 3
-                    self.get_logger().info("[Seq 1 - Stage 2] Alignment complete! Advancing to Stage 3 (Final Move).")
+                    self.get_logger().info("[Seq 3 - Stage 2] Alignment complete! Advancing to Stage 3 (Final Move).")
 
             if self.seq1_stage == 3:
                 dist = np.sqrt((target_x - p_xl)**2 + (target_y - p_yl)**2)
@@ -304,7 +336,7 @@ class TurtlesimSequenceController(Node):
                 distance_to_target = np.sqrt((p_xg - p_xl)**2 + (p_yg - p_yl)**2)
                 if distance_to_target <= tolerance:
                     self.seq4_stage = 1
-                    self.get_logger().info("[Seq 5 - Stage 0] Arrived at puck location. Advancing to Stage 1 (Orientation Alignment).")
+                    self.get_logger().info("[Seq 7 - Stage 0] Arrived at puck location. Advancing to Stage 1 (Orientation Alignment).")
                     return 0.0, 0.0
                 else:
                     e_x, e_y = p_xg - p_xl, p_yg - p_yl
@@ -320,7 +352,7 @@ class TurtlesimSequenceController(Node):
                     return 0.0, float(w)
                 else:
                     self.seq4_completed = True
-                    self.get_logger().info("[Seq 5 - Stage 1] Puck orientation alignment complete!")
+                    self.get_logger().info("[Seq 7 - Stage 1] Puck orientation alignment complete!")
                     return 0.0, 0.0
 
         return 0.0, 0.0
