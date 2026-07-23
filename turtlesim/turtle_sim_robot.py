@@ -26,6 +26,10 @@ class TurtlesimSequenceController(Node):
         self.declare_parameter('kp_w', 1.7) # Snappier angular corrections for simulation
         self.declare_parameter('l', 0.15)
         self.declare_parameter('tolerance', 0.15)
+        # Perpendicular shift of the approach goal point, relative to the target's facing
+        # direction (target_theta). Positive = robot's right of target_theta, negative = left.
+        # Mirrors robot.py so this can be rehearsed in sim before the real-robot lab session.
+        self.declare_parameter('sideway_offset', 0.0)
 
         self.L_inv = np.array([[1, 0], [0, 1/self.get_parameter('l').value]])
         
@@ -142,6 +146,12 @@ class TurtlesimSequenceController(Node):
 
         p_xg += l * math.cos(target_theta)
         p_yg += l * math.sin(target_theta)
+
+        # Shift the goal sideways off the target center so the arm EE lines up with the
+        # actual stick, which sits off-center on its base (positive = target's right side).
+        sideway_offset = self.get_parameter('sideway_offset').value
+        p_xg += sideway_offset * math.sin(target_theta)
+        p_yg -= sideway_offset * math.cos(target_theta)
 
         distance_to_target = np.sqrt((p_xg - p_xl)**2 + (p_yg - p_yl)**2)
         angle_error = np.arctan2(np.sin(target_theta - theta), np.cos(target_theta - theta))

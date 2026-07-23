@@ -32,7 +32,11 @@ class Robot(Node):
         self.declare_parameter('l', 0.15)
         # TODO: Determine a good tolerance value
         self.declare_parameter('tolerance', 0.15)
-        self.declare_parameter('start_sequence', 1) 
+        # Perpendicular shift of the approach goal point, relative to the target's facing
+        # direction (target_theta). Positive = robot's right of target_theta, negative = left.
+        # Tune this in the lab to compensate for the hockey stick sitting off-center on its base.
+        self.declare_parameter('sideway_offset', 0.0)
+        self.declare_parameter('start_sequence', 1)
 
         self.current_sequence = self.get_parameter('start_sequence').value
 
@@ -155,6 +159,13 @@ class Robot(Node):
         target_theta = self.get_yaw_from_quaternion(self.current_target_pose.orientation)
 
         target_theta = np.arctan2(np.sin(target_theta), np.cos(target_theta))
+
+        # Shift the goal sideways off the target center so the arm EE lines up with the
+        # actual stick, which sits off-center on its base (positive = target's right side).
+        sideway_offset = self.get_parameter('sideway_offset').value
+        p_xg += sideway_offset * math.sin(target_theta)
+        p_yg -= sideway_offset * math.cos(target_theta)
+
         p_xl = x + l * math.cos(theta)
         p_yl = y + l * math.sin(theta)
 
