@@ -5,6 +5,64 @@ Newest entries on top. Uncommitted in git as of this entry — see `git status`.
 
 ---
 
+## 2026-07-27 — `--shoot_mode push`: side-gripped stick shepherds the puck into the goal
+
+Alternative shooting strategy for robot 6 (swing stays the default and the fallback).
+Instead of spinning to whack the puck, the shooter grips the stick **sideways** so the
+ground-touching blade rides at a forward-lateral offset from the chassis, then drives
+behind the puck and pushes it goalward, releasing near the mouth so it slides in.
+Removes the swing's ~100 ms contact-timing problem entirely and works on a moving puck.
+
+### `robot.py`
+- **`--shoot_mode {swing,push}`** (default swing — nothing changes unless passed).
+- Push mode changes `MOVE_TO_STICK`: docks from the stick's **right side** (standoff
+  and alignment rotate −90° off the stick axis). The stick-frame
+  `sideways/vertical_offset`s still apply to the grab point unchanged.
+- **Tool-point control**: the controller servos the blade point `b = (b_fwd, b_lat)`
+  fixed in the body frame (`--push_b_fwd` 0.45, `--push_b_lat` −0.25 = right side) via
+  `[v,w] = B⁻¹ R(θ)ᵀ ṗ`, `B = [[1, −b_lat],[0, b_fwd]]` — the 2D generalization of
+  the look-ahead `L_inv`. `b_fwd` must be > 0 (singular otherwise; enforced).
+  **These values must match the sim's `SIDE_BLADE_BODY`; measure them on the real
+  gripped stick before the lab.**
+- **New sequence `PUSH_PUCK`** (route: … MOVE_TO_WAIT → LOWER_STICK → WAIT_FOR_PASS →
+  PUSH_PUCK → HIT_DONE): stage blade `--push_follow_gap` (0.5 m) behind the puck on
+  the puck→goal line (target recomputed every tick, so a still-moving pass is
+  intercepted) → align heading to goal → creep at `--push_speed` (0.35 m/s) →
+  release at `--push_release_dist` (0.4 m; sim slide ≈ speed/0.8 = 0.44 m) →
+  re-engage automatically if the puck stalls short.
+- WAIT_FOR_PASS: push mode drops the puck-stopped condition (it can chase); swing
+  keeps it. The virtual-puck CBF obstacle is lifted during PUSH_PUCK only.
+
+### `~/multi_robomaster_ros_sim`
+- **Carry style is inferred from grab geometry**: face-on grab → legacy centerline
+  carry (swing physics); perpendicular grab → side carry, blade at body-frame
+  (0.45, ∓0.25) (`SIDE_BLADE_BODY`), stick drawn diagonally, VRPN pose follows.
+- **Pushing contact physics** for side carries: the blade transfers only its
+  approaching (normal) velocity component — shepherds a moving puck, never pulls or
+  brakes it, no resting-puck gate. Swing impulse physics unchanged for center carry.
+- **Stick 2 moved to (−0.9, −0.9, 90°)** so both the right-side dock (push) and the
+  face-on dock (swing fallback) stay in-bounds and clear of the puck.
+
+### How to run — pass + push-shoot
+```bash
+# T1: cd ~/multi_robomaster_ros_sim && sudo bash run.sh
+# T2 (shooter, start first):
+python3 /ece687_robot_prod/robot.py --robot_id 6 --sim_mode --hit_mode --wait_for_pass \
+    --shoot_mode push --hockey_stick_id 2 --standoff_distance 2.0
+# T3 (passer, unchanged):
+python3 /ece687_robot_prod/robot.py --robot_id 1 --sim_mode --hit_mode \
+    --pass_to_robot 6 --standoff_distance 1.0 --hit_spin_speed 3.0
+```
+Swing fallback for robot 6: same command with `--shoot_mode swing` (or omit) —
+recommend `--standoff_distance 1.0` there so the face-on stick standoff stays clear.
+
+Known sim-to-real caveats: the sim's point-contact push holds the puck on the blade
+perfectly; a real puck slips sideways off a straight blade (push slowly, expect
+corrections). The pass still ghosts through the waiting robot's chassis in the sim
+(no puck-body collision); in the lab the puck may bounce off the shooter instead.
+
+---
+
 ## 2026-07-25 — Two-robot pass-and-shoot: `--hit_mode` / `--wait_for_pass` + sim game physics
 
 Implements the actual project spec: robot 1 grabs stick 1 and **passes** the puck to

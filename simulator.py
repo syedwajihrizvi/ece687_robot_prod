@@ -12,7 +12,7 @@ import matplotlib.patches as patches
 import matplotlib.pyplot as plt
 
 class MultiRoboMasterSim(Node):
-    def __init__(self, stick_poses=((1.2, 1.2, -pi / 2), (-1.2, -1.2, 0.0)),
+    def __init__(self, stick_poses=((1.2, 1.2, -pi / 2), (-0.9, -0.9, pi / 2)),
                  stick_ids=(1, 2), puck_pose=(-1.2, 1.2), puck_color='blue',
                  goal_pose=(0.0, -1.75, pi / 2), goal_size=(0.9, 0.25),
                  goal_standoff=2.0, spawn_clearance=0.7):
@@ -45,13 +45,18 @@ class MultiRoboMasterSim(Node):
         self.PUCK_MAX_SPEED = 2.5 # meters / second
         self.HIT_MARGIN = 0.25 # stick tip within PUCK_RADIUS + this of the puck counts as contact
         self.MIN_HIT_SPEED = 0.5 # tip speeds below this don't launch the puck
+        # side carry (stick gripped across the shaft, blade trailing on the ground):
+        self.PUSH_CONTACT_DIST = 0.18 # blade-to-puck distance that counts as pushing contact
+        self.SIDE_BLADE_BODY = {'side_right': np.array([0.45, -0.25]),
+                                'side_left': np.array([0.45, 0.25])} # blade point in the robot body frame
+        self.SIDE_GRIP_BODY = np.array([0.21, 0.0]) # gripper jaw position in the body frame
         self.SPAWN_CLEARANCE = spawn_clearance # min spawn distance from props/other robots
 
         # Hockey props state (initial poses kept for in-place game resets)
         self._initial_stick_poses = {sid: np.array(sp, dtype=float) for sid, sp in zip(stick_ids, stick_poses)}
         self._initial_puck_pos = np.array(puck_pose, dtype=float)
         self._goal_standoff = goal_standoff
-        self.sticks = {sid: {'pose': p.copy(), 'attached_to': None}
+        self.sticks = {sid: {'pose': p.copy(), 'attached_to': None, 'carry': 'center'}
                        for sid, p in self._initial_stick_poses.items()}
         self.puck_pos = self._initial_puck_pos.copy()
         self.puck_vel = np.zeros(2)
@@ -144,6 +149,7 @@ class MultiRoboMasterSim(Node):
         for sid, s in self.sticks.items():
             s['pose'] = self._initial_stick_poses[sid].copy()
             s['attached_to'] = None
+            s['carry'] = 'center'
         self.puck_pos = self._initial_puck_pos.copy()
         self.puck_vel = np.zeros(2)
         self.goal_scored = False
@@ -336,8 +342,20 @@ class MultiRoboMasterSim(Node):
             robot_p = self.states[rid][:2]
             for sid, s in self.sticks.items():
                 if s['attached_to'] is None and np.linalg.norm(s['pose'][:2] - robot_p) <= self.GRAB_RADIUS:
+                    # Carry style follows the grab geometry: a face-on grab (robot anti-parallel
+                    # to the stick axis) gives the legacy centerline carry used for swings; a
+                    # perpendicular grab clamps the shaft sideways, blade trailing at a
+                    # forward-lateral offset (push mode)
+                    d_theta = s['pose'][2] - self.states[rid][2]
+                    d_theta = np.arctan2(np.sin(d_theta), np.cos(d_theta))
+                    if abs(np.arctan2(np.sin(d_theta + np.pi / 2), np.cos(d_theta + np.pi / 2))) <= np.pi / 4:
+                        s['carry'] = 'side_right' # grabbed from the stick's right side
+                    elif abs(np.arctan2(np.sin(d_theta - np.pi / 2), np.cos(d_theta - np.pi / 2))) <= np.pi / 4:
+                        s['carry'] = 'side_left'
+                    else:
+                        s['carry'] = 'center'
                     s['attached_to'] = rid
-                    self.get_logger().info(f"Robot {rid} grabbed stick {sid}")
+                    self.get_logger().info(f"Robot {rid} grabbed stick {sid} ({s['carry']} carry)")
                     return
             self.get_logger().warn(f"Robot {rid} closed its gripper but no stick is within {self.GRAB_RADIUS} m")
         else: # gripper opened -> drop any carried stick in place
@@ -355,29 +373,66 @@ class MultiRoboMasterSim(Node):
         s_dist = float(np.dot(rel, side))
         return -self.goal_size[1] <= f_dist <= 0.05 and abs(s_dist) <= self.goal_size[0] / 2.0
 
+    def __carried_stick_pose(self, rid, carry):
+        """World (junction position, yaw) of a stick carried by robot `rid`."""
+        th = self.states[rid][2]
+        R = np.array([[cos(th), -sin(th)], [sin(th), cos(th)]])
+        c = self.states[rid][:2]
+        if carry == 'center':
+            return c + R @ np.array([self.STICK_HANDLE_OFFSET, 0.0]), th
+        blade_body = self.SIDE_BLADE_BODY[carry]
+        axis_body = blade_body - self.SIDE_GRIP_BODY
+        axis_angle = float(np.arctan2(axis_body[1], axis_body[0]))
+        junction_body = blade_body - self.STICK_LEG_LENGTH * np.array([np.cos(axis_angle), np.sin(axis_angle)])
+        return c + R @ junction_body, th + axis_angle
+
     def __update_props(self, applied):
-        # Carried sticks track their robot; a fast-moving stick tip launches the puck
+        # Carried sticks track their robot; contact physics depends on the carry style:
+        # center carry = swing (impulse launch), side carry = push (normal-force shepherding)
         for sid, s in self.sticks.items():
             rid = s['attached_to']
             if rid is None:
                 continue
-            th = self.states[rid][2]
-            heading = np.array([cos(th), sin(th)])
-            s['pose'][:2] = self.states[rid][:2] + self.STICK_HANDLE_OFFSET * heading
-            s['pose'][2] = th
+            junction, yaw = self.__carried_stick_pose(rid, s['carry'])
+            s['pose'][:2] = junction
+            s['pose'][2] = yaw
 
-            # Hit detection: only a resting puck can be launched (prevents multi-hits per swing)
-            if self.goal_scored or np.linalg.norm(self.puck_vel) >= 0.1:
+            if self.goal_scored:
                 continue
-            tip = self.states[rid][:2] + self.STICK_TIP_DIST * heading
-            if np.linalg.norm(tip - self.puck_pos) <= self.PUCK_RADIUS + self.HIT_MARGIN:
-                w = applied[rid][2]
-                tip_vel = applied[rid][:2] + w * self.STICK_TIP_DIST * np.array([-sin(th), cos(th)])
-                speed = float(np.linalg.norm(tip_vel))
-                if speed > self.MIN_HIT_SPEED:
-                    self.puck_vel = tip_vel / speed * min(speed, self.PUCK_MAX_SPEED)
-                    self.get_logger().info(
-                        f"Puck hit by robot {rid} (stick {sid}): launched at {np.linalg.norm(self.puck_vel):.2f} m/s")
+            th = self.states[rid][2]
+            c = self.states[rid][:2]
+            w = applied[rid][2]
+
+            if s['carry'] == 'center':
+                # Swing hit: impulse launch; only a resting puck (prevents multi-hits per swing)
+                if np.linalg.norm(self.puck_vel) >= 0.1:
+                    continue
+                tip = c + self.STICK_TIP_DIST * np.array([cos(th), sin(th)])
+                if np.linalg.norm(tip - self.puck_pos) <= self.PUCK_RADIUS + self.HIT_MARGIN:
+                    tip_vel = applied[rid][:2] + w * self.STICK_TIP_DIST * np.array([-sin(th), cos(th)])
+                    speed = float(np.linalg.norm(tip_vel))
+                    if speed > self.MIN_HIT_SPEED:
+                        self.puck_vel = tip_vel / speed * min(speed, self.PUCK_MAX_SPEED)
+                        self.get_logger().info(
+                            f"Puck hit by robot {rid} (stick {sid}): launched at {np.linalg.norm(self.puck_vel):.2f} m/s")
+            else:
+                # Push contact: the blade transfers only its approaching (normal) velocity
+                # component — it can shepherd a moving puck but never pull or brake it.
+                # No resting gate: pushing a rolling puck is the whole point.
+                R = np.array([[cos(th), -sin(th)], [sin(th), cos(th)]])
+                blade = c + R @ self.SIDE_BLADE_BODY[s['carry']]
+                rel_p = self.puck_pos - blade
+                d = float(np.linalg.norm(rel_p))
+                if 1e-6 < d <= self.PUSH_CONTACT_DIST:
+                    n = rel_p / d
+                    r_blade = blade - c
+                    blade_vel = applied[rid][:2] + w * np.array([-r_blade[1], r_blade[0]])
+                    approach = float(np.dot(blade_vel - self.puck_vel, n))
+                    if approach > 0.0:
+                        self.puck_vel = self.puck_vel + approach * n
+                        pv = float(np.linalg.norm(self.puck_vel))
+                        if pv > self.PUCK_MAX_SPEED:
+                            self.puck_vel = self.puck_vel / pv * self.PUCK_MAX_SPEED
 
         # Puck kinematics: integrate with exponential damping, stop at walls, detect goals
         if np.linalg.norm(self.puck_vel) > 1e-3:
@@ -436,9 +491,10 @@ def main(args=None):
     parser.add_argument('--stick_y', type=float, default=1.2, help='Stick 1 y position (m)')
     parser.add_argument('--stick_theta_deg', type=float, default=-90.0,
                         help='Stick 1 facing angle (deg); the T leg and the standoff point both lie along this direction — keep it pointed away from the puck')
-    parser.add_argument('--stick2_x', type=float, default=-1.2, help='Stick 2 x position (m)')
-    parser.add_argument('--stick2_y', type=float, default=-1.2, help='Stick 2 y position (m)')
-    parser.add_argument('--stick2_theta_deg', type=float, default=0.0, help='Stick 2 facing angle (deg); keep it pointed away from the puck')
+    parser.add_argument('--stick2_x', type=float, default=-0.9, help='Stick 2 x position (m)')
+    parser.add_argument('--stick2_y', type=float, default=-0.9, help='Stick 2 y position (m)')
+    parser.add_argument('--stick2_theta_deg', type=float, default=90.0,
+                        help='Stick 2 facing angle (deg); placed so both the right-side (push) and face-on (swing) approaches stay in-bounds and clear of the puck')
     parser.add_argument('--puck_x', type=float, default=-1.2, help='Puck x position (m)')
     parser.add_argument('--puck_y', type=float, default=1.2, help='Puck y position (m)')
     parser.add_argument('--hockey_stick_id', type=int, default=1, help='ID tag for the stick 1 VRPN topic')
