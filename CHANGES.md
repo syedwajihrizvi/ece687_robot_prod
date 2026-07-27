@@ -39,8 +39,11 @@ into a goal gate. Swing geometry follows the MATLAB reference sim
 
 ### `~/multi_robomaster_ros_sim` (separate repo)
 - Roster is now robots **[1, 2, 3, 6]** (1 = passer, 6 = shooter, 2–3 obstacles).
-- **Two sticks** (`hockey_sticks_1` at (1.2, 1.2, 180°), `hockey_sticks_2` at
-  (−1.2, −1.2, 90°), flags `--stick2_x/y/theta_deg`). Gripper close within 0.5 m of a
+- **Two sticks** (`hockey_sticks_1` at (1.2, 1.2, −90°), `hockey_sticks_2` at
+  (−1.2, −1.2, 0°), flags `--stick2_x/y/theta_deg`). Stick facings deliberately point
+  *away* from the puck: the approach standoff lies along the facing, and a facing
+  aimed at the puck sends the robot "to the puck first" (and the virtual-puck CBF
+  makes `get_valid_standoff_distance` march the standoff through and past it). Gripper close within 0.5 m of a
   stick junction attaches it; the carried stick tracks the robot (T junction 0.10 m
   ahead, tip 0.55 m ahead) and is drawn accordingly.
 - **Puck physics**: a resting puck hit by a stick tip moving >0.5 m/s launches along
@@ -53,6 +56,13 @@ into a goal gate. Swing geometry follows the MATLAB reference sim
   puck dotted blue).
 - Spawn resampling now also keeps clear of stick 2, the goal, and the shooter's
   waiting spot.
+- **In-place game reset**: press `r` in the sim window, or
+  `ros2 topic pub --once /sim/reset std_msgs/msg/Empty "{}"` — restores sticks/puck,
+  respawns robots, clears trails, no process restart. Stop the controllers first.
+- **`run.sh` now keeps the container alive**: first run creates a persistent
+  container (`sleep infinity`) and execs the simulator into it; Ctrl+C kills only the
+  simulator, and rerunning `run.sh` rebuilds + relaunches in seconds. Full teardown:
+  `sudo docker rm -f dji_robomaster_ros_simulator`.
 
 ### How to run — two-robot pass-and-shoot (WSL Ubuntu)
 ```bash

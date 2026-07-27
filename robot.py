@@ -691,8 +691,15 @@ class Robot(Node):
 
         # --- MULTI-STAGE CONTROL FOR MOVE_TO_STICK ---
         if self.current_sequence == Sequence.MOVE_TO_STICK:
-            target_x = p_xg + self.get_parameter('vertical_offset').value
-            target_y = p_yg + self.get_parameter('sideways_offset').value
+                # Offsets live in the stick's own frame, not the world frame:
+                #   vertical_offset -> along +stick axis (same direction the standoff extends)
+                #   sideways_offset -> 90 deg left of that axis
+                # Rotating by target_theta makes both track the stick's yaw.
+            offset_stick = np.array([[self.get_parameter('vertical_offset').value],
+                                     [self.get_parameter('sideways_offset').value]])
+            offset_world = self.get_rotation_matrix(target_theta) @ offset_stick
+            target_x = p_xg + float(offset_world[0, 0])
+            target_y = p_yg + float(offset_world[1, 0])
 
             valid_standoff_dist, standoff_x, standoff_y = self.get_valid_standoff_distance(
                 target_x, target_y, target_theta, standoff_dist
@@ -948,6 +955,17 @@ def main(args=None):
     args, remaining = parser.parse_known_args(args)
     if args.mock_mode and args.sim_mode:
         parser.error('--mock_mode and --sim_mode are mutually exclusive')
+    # Leftover args are forwarded to rclpy, which silently discards unknown ones — so a
+    # typo like --sideway_offset would be ignored without a trace. Reject any flag-like
+    # token that appears before --ros-args.
+    typo_flags = []
+    for tok in remaining:
+        if tok == '--ros-args':
+            break
+        if tok.startswith('--'):
+            typo_flags.append(tok)
+    if typo_flags:
+        parser.error(f"unrecognized arguments: {' '.join(typo_flags)} (typo? see --help for valid flags)")
     rclpy.init(args=remaining)
     node = Robot(
         robot_id=args.robot_id, 
