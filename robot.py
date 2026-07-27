@@ -9,7 +9,7 @@ from rclpy.qos import QoSProfile, ReliabilityPolicy
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.callback_groups import ReentrantCallbackGroup
 from robomaster_msgs.action import GripperControl, MoveArm
-from geometry_msgs.msg import Twist, PoseStamped, Vector3
+from geometry_msgs.msg import Twist, PoseStamped, Vector3, Point
 from std_msgs.msg import Bool
 from scipy.optimize import minimize
 
@@ -25,6 +25,12 @@ Following Sequences
 7: Move to Puck
 8: Bring Stick to the Ground
 9: Release Puck
+10: Move to Wait Position
+11: Wait for Pass
+12: Align Hit
+13: Spin Hit
+14: Hit Done
+15: Push Puck
 """
 class Sequence(Enum):
     OPEN_GRIPPER = 0
@@ -37,7 +43,7 @@ class Sequence(Enum):
     MOVE_TO_PUCK = 7
     LOWER_STICK = 8
     RELEASE_PUCK = 9
-    # hit-mode sequences (pass/shoot by spinning the carried stick into the puck)
+    # Hit & Push Mode Sequences
     MOVE_TO_WAIT = 10
     WAIT_FOR_PASS = 11
     ALIGN_HIT = 12
@@ -50,16 +56,16 @@ class Robot(Node):
                  robot_id, 
                  pass_to_robot, 
                  hockey_stick_id=1, 
-                 puck_color='blue',
-                 mock_mode=False,
+                 puck_color='blue', 
+                 mock_mode=False, 
                  sim_mode=False,
-                 orient_to_stick=False,
-                 l_default=0.15, 
-                 tolerance_default=0.15, 
-                 sideways_offset=0.0, 
-                 vertical_offset=0.0, 
+                 orient_to_stick=False, 
+                 l_default=0.50, 
+                 tolerance_default=0.10, 
+                 sideways_offset=0.1, 
+                 vertical_offset=0.15, 
                  standoff_distance=2.5,
-                 r_safety=0.35,
+                 r_safety=0.5,
                  hit_mode=False,
                  wait_for_pass=False,
                  swing_offset=0.55,
@@ -79,13 +85,11 @@ class Robot(Node):
         self.robot_id = robot_id
         self.robot_name = f'/robot{robot_id}'
         self.gripper_action = f'/robot{robot_id}/gripper'
-        self.arm_action = f'/robot{robot_id}/arm'
+        self.arm_action = f'/robot{robot_id}/move_arm'
         self.pass_to_robot = pass_to_robot
         self.hockey_stick_id = hockey_stick_id
         self.puck_color = puck_color
         self.mock_mode = mock_mode
-        # sim_mode: fake gripper/arm actions like mock_mode, but keep the real /vrpn_mocap
-        # topics — for running against the Docker multi_robomaster_ros_sim simulator
         self.sim_mode = sim_mode
         self.orient_to_stick = orient_to_stick
         
@@ -114,61 +118,56 @@ class Robot(Node):
         self.filtered_u_p = None
 
         # Sub-stages trackers
-        self.seq1_stage = 0
-        self.seq1_completed = False
+        self.seq1_stage = 0 
+        self.seq1_completed = False 
         self.seq4_stage = 0
         self.seq4_completed = False
 
-        # Hit-mode state (pass/shoot by spinning the carried stick into the puck)
+        # Hit-mode state
         self.hit_mode = hit_mode
         self.wait_for_pass = wait_for_pass
-        # shoot_mode 'push': grip the stick sideways (right-side dock) and shepherd the
-        # puck into the goal with the trailing blade instead of swinging
         self.shoot_mode = shoot_mode
-        self.push_stage = 0        # PUSH_PUCK sub-stage (0 stage-behind, 1 align, 2 push, 3 released)
-        self.hit_side = None       # +1/-1: which side of the puck->aim line the robot swings from
-        self.spin_accum = 0.0      # accumulated rotation during SPIN_HIT
-        self.wait_stage = 0        # MOVE_TO_WAIT sub-stage (0 rotate, 1 drive)
-        self.puck_speed = 0.0      # low-pass filtered puck speed estimate from mocap
+        self.push_stage = 0
+        self.hit_side = None
+        self.spin_accum = 0.0
+        self.wait_stage = 0
+        self.puck_speed = 0.0
         self._puck_prev_time = None
-        self._initial_puck_pos = None  # first observed puck position (pass detection reference)
+        self._initial_puck_pos = None
 
         # Controller tunings & parameters
         self.declare_parameter('control_frequency', 10.0)
         self.declare_parameter('kp_v', 1.2)
-        self.declare_parameter('kp_w', 2.0)
+        self.declare_parameter('kp_w', 1.0)
         self.declare_parameter('v_max', 1.0)  # Maximum workspace velocity cap (m/s)
+        self.l = l_default
         self.declare_parameter('l', l_default)
         self.declare_parameter('tolerance', tolerance_default)
         self.declare_parameter('standoff_distance', standoff_distance)
-        self.declare_parameter('start_sequence', 0)
+        self.declare_parameter('start_sequence', 0) 
         self.declare_parameter('sideways_offset', sideways_offset)
         self.declare_parameter('vertical_offset', vertical_offset)
 
-        # Hit-mode tunables
-        self.declare_parameter('swing_offset', swing_offset)      # perpendicular park distance from the puck (~= sim stick tip length)
-        self.declare_parameter('wait_radius', wait_radius)        # puck within this range of the shooter triggers the shot phase
-        self.declare_parameter('hit_spin_speed', hit_spin_speed)  # rad/s during SPIN_HIT; launch speed ~= this * swing_offset
-        self.declare_parameter('hit_swing_angle', hit_swing_angle) # total SPIN_HIT sweep (rad); contact happens ~pi in
+        # Extended mode tunables
+        self.declare_parameter('swing_offset', swing_offset)
+        self.declare_parameter('wait_radius', wait_radius)
+        self.declare_parameter('hit_spin_speed', hit_spin_speed)
+        self.declare_parameter('hit_swing_angle', hit_swing_angle)
         self.declare_parameter('goal_x', goal_x)
         self.declare_parameter('goal_y', goal_y)
         self.declare_parameter('goal_yaw', goal_yaw_deg * math.pi / 180.0)
 
-        # Push-mode tunables: blade contact point in the body frame (b_fwd must be > 0 or
-        # the tool-point linearization is singular), creep speed, staging gap, release range
         self.declare_parameter('push_b_fwd', push_b_fwd)
         self.declare_parameter('push_b_lat', push_b_lat)
         self.declare_parameter('push_speed', push_speed)
         self.declare_parameter('push_follow_gap', push_follow_gap)
         self.declare_parameter('push_release_dist', push_release_dist)
-
+        
         self.current_sequence = Sequence(self.get_parameter('start_sequence').value)
 
-        # Sequence route: hit-mode replaces the RELEASE_PUCK stub with the swing-hit tail,
-        # and the shooter inserts the wait-at-goal-standoff phase before approaching the puck
-        base_route = [Sequence(i) for i in range(7)]  # OPEN_GRIPPER .. MOVE_BACK_ROTATE
+        # Dynamic Route Construction
+        base_route = [Sequence(i) for i in range(7)]
         if self.hit_mode and self.shoot_mode == 'push':
-            # Push: lower the blade while parked, then shepherd the puck goalward
             if self.wait_for_pass:
                 self.sequence_route = base_route + [Sequence.MOVE_TO_WAIT, Sequence.LOWER_STICK,
                                                     Sequence.WAIT_FOR_PASS, Sequence.PUSH_PUCK, Sequence.HIT_DONE]
@@ -182,9 +181,9 @@ class Robot(Node):
             else:
                 self.sequence_route = base_route + hit_tail
         else:
-            self.sequence_route = [Sequence(i) for i in range(10)]  # original behavior
+            self.sequence_route = [Sequence(i) for i in range(10)]
 
-        self.L_inv = np.array([[1, 0], [0, 1 / self.get_parameter('l').value]])
+        self.L_inv = np.array([[1, 0], [0, 1 / self.l]])
         self._action_group = ReentrantCallbackGroup()
         self.gripper_action_client = None
         self.arm_action_client = None
@@ -203,7 +202,7 @@ class Robot(Node):
             self.arm_action_client = ActionClient(
                 self,
                 MoveArm,
-                self.arm_action,
+                self.arm_action, 
                 callback_group=self._action_group
             )
             self.get_logger().info("Waiting for arm action server...")
@@ -237,13 +236,18 @@ class Robot(Node):
                 self.create_subscription(PoseStamped, topic_name, self.obstacle_pos_callback(key), qos)
             
         self.pub_cmd_vel = self.create_publisher(Twist, f'{self.robot_name}/cmd_vel', 10)
-        self.pub_cmd_arm = self.create_publisher(Vector3, f'{self.robot_name}/cmd_arm', 10)
-        # sim_mode: tells the simulator to attach/release the stick on gripper close/open
+        self.pub_cmd_arm = self.create_publisher(Point, f'{self.robot_name}/target_arm_position', 10)
         self.pub_gripper_sim = self.create_publisher(Bool, f'{self.robot_name}/gripper_sim', 10) if self.sim_mode else None
+        self.pub_ready_to_pass_puck = self.create_publisher(Bool, f'{self.robot_name}/ready_to_pass_puck', 10)
+        self.pub_ready_to_receive_puck = self.create_publisher(Bool, f'{self.robot_name}/ready_to_receive_puck', 10)
+
+        # Publish initial false for passing or receiving puck readiness
+        self.publish_ready_to_pass_puck(False)
+        self.publish_ready_to_receive_puck(False)
         self.get_logger().info(f'Robot node initialized at sequence state: {self.current_sequence.name} with stick ID: {self.hockey_stick_id} & puck color: {self.puck_color}')
 
     def advance_sequence(self):
-        """Advances state machine along the active sequence route and resets velocity filter memory."""
+        """Advances state machine along sequence_route and resets velocity filter memory."""
         try:
             idx = self.sequence_route.index(self.current_sequence)
             self.current_sequence = self.sequence_route[idx + 1]
@@ -281,16 +285,12 @@ class Robot(Node):
         self.puck_pose = msg.pose
 
     def get_push_tool_point(self, x, y, theta):
-        """World position of the stick blade (ground-touching tip) for push mode."""
         b_fwd = self.get_parameter('push_b_fwd').value
         b_lat = self.get_parameter('push_b_lat').value
         p = np.array([x, y]) + self.get_rotation_matrix(theta) @ np.array([b_fwd, b_lat])
         return float(p[0]), float(p[1])
 
     def push_tool_control(self, theta, p_dot_x, p_dot_y):
-        """Map a desired blade-point velocity to (v, w): [v, w] = B^-1 R(theta)^T p_dot with
-        B = [[1, -b_lat], [0, b_fwd]] — the 2D generalization of the look-ahead L_inv
-        (b_lat = 0, b_fwd = l recovers the original). Requires b_fwd != 0."""
         b_fwd = self.get_parameter('push_b_fwd').value
         b_lat = self.get_parameter('push_b_lat').value
         B_inv = np.array([[1.0, b_lat / b_fwd], [0.0, 1.0 / b_fwd]])
@@ -298,7 +298,6 @@ class Robot(Node):
         return float(u[0, 0]), float(u[1, 0])
 
     def get_aim_point(self):
-        """Where the puck should be sent: the ally robot's live pose (pass) or the goal mouth."""
         if self.pass_to_robot:
             pose = self.obstacle_poses.get(f'obstacle_robot_{self.pass_to_robot}')
             if pose is None:
@@ -312,10 +311,6 @@ class Robot(Node):
         return callback
 
     def get_valid_standoff_distance(self, target_x, target_y, target_theta, initial_standoff):
-        """
-        Checks if computed standoff position overlaps with any obstacle's safety radius.
-        Dynamically increases standoff distance until it is completely clear of obstacles.
-        """
         r_safety = self.get_parameter('r_safety').value
         current_standoff = initial_standoff
         step_increment = 0.1
@@ -357,9 +352,6 @@ class Robot(Node):
         return current_standoff, st_x, st_y
 
     def solve_clf_cbf_qp(self, p_xl, p_yl, p_dot_x_nom, p_dot_y_nom, target_x, target_y):
-        """
-        QP Filter enforcing Control Lyapunov Functions (CLF) and Control Barrier Functions (CBF).
-        """
         r_safety = self.get_parameter('r_safety').value
         gamma_cbf = self.get_parameter('gamma_cbf').value
         gamma_clf = self.get_parameter('gamma_clf').value
@@ -458,14 +450,14 @@ class Robot(Node):
         return float(self.filtered_u_p[0]), float(self.filtered_u_p[1])
 
     def control_loop(self):
+        self.get_logger().info(f"Current Sequence: {self.current_sequence}")
         if self.robot_pose is None:
             self.get_logger().warn("Waiting for robot pose...", throttle_duration_sec=2.0)
             return
 
         now = self.get_clock().now()
 
-        # Hit mode: treat the puck as a CBF obstacle so no driving leg rolls over it —
-        # except while actively pushing, which requires closing to blade-contact range
+        # Dynamic CBF Obstacle logic for puck in hit mode
         if self.hit_mode and self.puck_pose is not None:
             if self.current_sequence == Sequence.PUSH_PUCK:
                 self.obstacle_poses.pop('virtual_puck', None)
@@ -486,27 +478,12 @@ class Robot(Node):
 
         # Sequence 1: Move Arm to Origin Action (0.0, 0.0)
         elif self.current_sequence == Sequence.MOVE_EE_TO_ORIGIN:
-            if self.state_start_time is None:
-                elapsed_retry_time = 3.0
-            else:
-                elapsed_retry_time = (now - self.state_start_time).nanoseconds / 1e9
-            if elapsed_retry_time >= 3.0 and not self.arm_action_running:
-                self.get_logger().info("Sequence 1: Dispatching arm move to origin request...")
-                self.state_start_time = now 
-                self.arm_action_running = True
-                self.move_arm_using_action(x=0.0, z=0.0, relative=False)
+            self.move_arm_using_publisher(x=0.2, z=0.0)
+            self.advance_sequence()
 
         # Sequence 2: Move Arm to Ref Pos Action (0.15, 0.15)
         elif self.current_sequence == Sequence.MOVE_EE_TO_REF_POS:
-            if self.state_start_time is None:
-                elapsed_retry_time = 3.0
-            else:
-                elapsed_retry_time = (now - self.state_start_time).nanoseconds / 1e9
-            if elapsed_retry_time >= 3.0 and not self.arm_action_running:
-                self.get_logger().info("Sequence 2: Dispatching arm move to reference position request...")
-                self.state_start_time = now 
-                self.arm_action_running = True
-                self.move_arm_using_action(x=0.15, z=0.15, relative=False)
+            self.advance_sequence()
 
         # Sequence 3 & 7: Spatial Tracking with CLF-CBF
         elif self.current_sequence in [Sequence.MOVE_TO_STICK, Sequence.MOVE_TO_PUCK]:
@@ -524,6 +501,10 @@ class Robot(Node):
             ):
                 self.pub_cmd_vel.publish(cmd)
                 self.get_logger().info(f"Sequence {self.current_sequence.name} completed!")
+                if (self.pass_to_robot):
+                    self.publish_ready_to_pass_puck(True)
+                else:
+                    self.publish_ready_to_receive_puck(True)
                 self.advance_sequence()
                 self.rotation_phase = False
                 self.state_start_time = None 
@@ -553,7 +534,7 @@ class Robot(Node):
             if self.state_start_time is None:
                 self.state_start_time = now
                 self.get_logger().info("Sequence 5: Dispatching arm LIFT command (waiting 2s)...")
-                self.arm_controller(direction=1)
+                self.move_arm_using_publisher(0.0, 0.2)
 
             elapsed_time = (now - self.state_start_time).nanoseconds / 1e9
             if elapsed_time >= 2.0:
@@ -585,7 +566,7 @@ class Robot(Node):
             if self.state_start_time is None:
                 self.state_start_time = now
                 self.get_logger().info("Sequence 8: Dispatching arm LOWER command (waiting 2s)...")
-                self.arm_controller(direction=-1)
+                self.move_arm_using_publisher(0.2, 0.0)
 
             elapsed_time = (now - self.state_start_time).nanoseconds / 1e9
             if elapsed_time >= 2.0:
@@ -601,7 +582,7 @@ class Robot(Node):
             self.release_puck()
             self.advance_sequence()
 
-        # Sequence 10: Park at the goal standoff point to await the pass (shooter)
+        # Sequence 10: Move to Wait Position
         elif self.current_sequence == Sequence.MOVE_TO_WAIT:
             l = self.get_parameter('l').value
             tolerance = self.get_parameter('tolerance').value
@@ -619,7 +600,6 @@ class Robot(Node):
             p_yl = y + l * math.sin(theta)
 
             cmd = Twist()
-            # Stage 0: rotate in place to face the waiting point
             if self.wait_stage == 0:
                 bearing = np.arctan2(wait_y - y, wait_x - x)
                 angle_error = np.arctan2(np.sin(bearing - theta), np.cos(bearing - theta))
@@ -629,7 +609,6 @@ class Robot(Node):
                     self.wait_stage = 1
                     self.filtered_u_p = None
                     self.get_logger().info("[Seq 10 - Stage 0] Heading aligned to waiting point. Advancing to Stage 1.")
-            # Stage 1: drive to the waiting point with CLF-CBF
             else:
                 dist = np.sqrt((wait_x - p_xl)**2 + (wait_y - p_yl)**2)
                 if dist <= tolerance:
@@ -652,7 +631,7 @@ class Robot(Node):
                 self.get_logger().info(f"Sequence MOVE_TO_WAIT: v={cmd.linear.x:.3f}, w={cmd.angular.z:.3f}", throttle_duration_sec=1.0)
             self.pub_cmd_vel.publish(cmd)
 
-        # Sequence 11: Hold position until the pass arrives (puck moved, close, and stopped)
+        # Sequence 11: Wait For Pass
         elif self.current_sequence == Sequence.WAIT_FOR_PASS:
             self.pub_cmd_vel.publish(Twist())
             if self.puck_pose is None or self._initial_puck_pos is None:
@@ -660,8 +639,6 @@ class Robot(Node):
             px, py = self.puck_pose.position.x, self.puck_pose.position.y
             displacement = math.hypot(px - self._initial_puck_pos[0], py - self._initial_puck_pos[1])
             dist_to_me = math.hypot(px - self.robot_pose.position.x, py - self.robot_pose.position.y)
-            # Swing needs the puck stopped (the swing is aimed at a fixed point); push can
-            # chase a moving puck, so it triggers as soon as the pass enters range
             speed_ok = self.puck_speed < 0.15 if self.shoot_mode == 'swing' else True
             if displacement > 0.3 and dist_to_me <= self.get_parameter('wait_radius').value and speed_ok:
                 self.get_logger().info(f"[Seq 11] Pass received: puck at ({px:.2f}, {py:.2f}), {dist_to_me:.2f} m away. Moving to shoot.")
@@ -671,7 +648,7 @@ class Robot(Node):
                     f"[Seq 11] Waiting for pass (moved {displacement:.2f} m, dist {dist_to_me:.2f} m, speed {self.puck_speed:.2f} m/s)...",
                     throttle_duration_sec=2.0)
 
-        # Sequence 12: Rotate the stick to point AWAY from the puck (slow, so the tip can't launch it)
+        # Sequence 12: Align Hit
         elif self.current_sequence == Sequence.ALIGN_HIT:
             if self.puck_pose is None:
                 return
@@ -684,7 +661,7 @@ class Robot(Node):
             cmd = Twist()
             if abs(angle_error) > 0.03:
                 Kp_w = self.get_parameter('kp_w').value
-                cmd.angular.z = float(np.clip(Kp_w * angle_error, -0.6, 0.6))  # capped: tip stays below launch speed
+                cmd.angular.z = float(np.clip(Kp_w * angle_error, -0.6, 0.6))
                 self.pub_cmd_vel.publish(cmd)
             else:
                 self.pub_cmd_vel.publish(Twist())
@@ -692,7 +669,7 @@ class Robot(Node):
                 self.get_logger().info("[Seq 12] Stick wound up (pointing away from puck). Starting swing.")
                 self.advance_sequence()
 
-        # Sequence 13: Fast swing — the stick tip sweeps through the puck, launching it toward the aim point
+        # Sequence 13: Spin Hit
         elif self.current_sequence == Sequence.SPIN_HIT:
             if self.hit_side is None:
                 self.hit_side = 1.0
@@ -707,9 +684,7 @@ class Robot(Node):
             else:
                 self.pub_cmd_vel.publish(cmd)
 
-        # Sequence 15: Push the puck into the goal (shoot_mode='push'): stage the blade
-        # behind the puck on the puck->goal line, align, creep forward so the blade
-        # shepherds it, release near the goal and let it slide in
+        # Sequence 15: Push Puck
         elif self.current_sequence == Sequence.PUSH_PUCK:
             if self.puck_pose is None:
                 self.pub_cmd_vel.publish(Twist())
@@ -740,8 +715,6 @@ class Robot(Node):
             u = np.array([gx - px, gy - py]) / d_goal
 
             cmd = Twist()
-            # Stage 0: bring the blade to a staging point behind the puck (recomputed each
-            # tick, so a still-moving pass is intercepted naturally)
             if self.push_stage == 0:
                 tx, ty = px - follow_gap * u[0], py - follow_gap * u[1]
                 if math.hypot(tx - blade_x, ty - blade_y) <= tolerance:
@@ -758,7 +731,6 @@ class Robot(Node):
                     cmd.linear.x = float(np.clip(v, -v_max, v_max))
                     cmd.angular.z = float(np.clip(w, -3.0, 3.0))
                     self.get_logger().info(f"Sequence PUSH_PUCK stage 0: v={cmd.linear.x:.2f}, w={cmd.angular.z:.2f}", throttle_duration_sec=1.0)
-            # Stage 1: rotate so the push axis points at the goal
             elif self.push_stage == 1:
                 desired = math.atan2(u[1], u[0])
                 err = np.arctan2(np.sin(desired - theta), np.cos(desired - theta))
@@ -768,7 +740,6 @@ class Robot(Node):
                     self.push_stage = 2
                     self.filtered_u_p = None
                     self.get_logger().info("[Seq 15 - Stage 1] Push heading aligned. Pushing.")
-            # Stage 2: creep forward with the blade servoed just behind the puck center
             elif self.push_stage == 2:
                 if d_goal <= release_dist:
                     self.push_stage = 3
@@ -783,8 +754,6 @@ class Robot(Node):
                     v, w = self.push_tool_control(theta, p_dot_x_nom, p_dot_y_nom)
                     cmd.linear.x = float(np.clip(v, 0.0, push_speed))
                     cmd.angular.z = float(np.clip(w, -1.5, 1.5))
-            # Stage 3: released — watch the slide; re-engage if the puck stalls short
-            # (success exits via the d_goal < 0.15 check at the top)
             else:
                 elapsed = (now - self.state_start_time).nanoseconds / 1e9 if self.state_start_time is not None else 0.0
                 if elapsed > 2.0 and self.puck_speed < 0.1:
@@ -792,7 +761,7 @@ class Robot(Node):
                     self.get_logger().warn(f"[Seq 15 - Stage 3] Puck stalled {d_goal:.2f} m from the goal. Re-engaging.")
             self.pub_cmd_vel.publish(cmd)
 
-        # Sequence 14: Hit finished
+        # Sequence 14: Hit Done
         elif self.current_sequence == Sequence.HIT_DONE:
             self.pub_cmd_vel.publish(Twist())
             dest = f"robot {self.pass_to_robot}" if self.pass_to_robot else "the goal"
@@ -825,20 +794,12 @@ class Robot(Node):
 
         # --- MULTI-STAGE CONTROL FOR MOVE_TO_STICK ---
         if self.current_sequence == Sequence.MOVE_TO_STICK:
-                # Offsets live in the stick's own frame, not the world frame:
-                #   vertical_offset -> along +stick axis (same direction the standoff extends)
-                #   sideways_offset -> 90 deg left of that axis
-                # Rotating by target_theta makes both track the stick's yaw.
             offset_stick = np.array([[self.get_parameter('vertical_offset').value],
                                      [self.get_parameter('sideways_offset').value]])
             offset_world = self.get_rotation_matrix(target_theta) @ offset_stick
             target_x = p_xg + float(offset_world[0, 0])
             target_y = p_yg + float(offset_world[1, 0])
 
-            # Push mode: dock from the stick's RIGHT side (the gripper clamps the shaft
-            # sideways so the blade rides at a forward-lateral offset when carried).
-            # Standoff and final alignment rotate -90 deg off the stick axis; the
-            # stick-frame offsets above are unaffected.
             approach_theta = target_theta
             if self.shoot_mode == 'push':
                 approach_theta = np.arctan2(np.sin(target_theta - np.pi / 2.0), np.cos(target_theta - np.pi / 2.0))
@@ -897,6 +858,7 @@ class Robot(Node):
             # Stage 3: Drive final approach to stick
             elif self.seq1_stage == 3:
                 dist = np.sqrt((target_x - p_xl)**2 + (target_y - p_yl)**2)
+                self.get_logger().info(f"Distance to stick: {dist}")
                 if dist <= tolerance:
                     self.seq1_completed = True 
                     return 0.0, 0.0  
@@ -917,9 +879,6 @@ class Robot(Node):
 
         # --- STREAMLINED CONTROL FOR MOVE_TO_PUCK ---
         elif self.current_sequence == Sequence.MOVE_TO_PUCK:
-            # Hit mode: don't drive at the puck itself — park at the swing center, a point
-            # offset perpendicular to the puck->aim line so the spinning stick tip sweeps
-            # through the puck in the aim direction (MATLAB swingCenterTarget geometry)
             if self.hit_mode:
                 aim = self.get_aim_point()
                 if aim is None:
@@ -984,7 +943,7 @@ class Robot(Node):
         if self.mock_mode or self.sim_mode:
             if self.sim_mode:
                 grip_msg = Bool()
-                grip_msg.data = not open  # True = closed
+                grip_msg.data = not open
                 self.pub_gripper_sim.publish(grip_msg)
             self.get_logger().info(f"Mock/sim mode active: {'Opening' if open else 'Closing'} gripper simulated.")
             self.gripper_action_running = False
@@ -994,6 +953,7 @@ class Robot(Node):
         self.get_logger().info("Gripper Operation running...") 
         goal = GripperControl.Goal()
         goal.target_state = 1 if open else 2
+        goal.power = 0.65
         future = self.gripper_action_client.send_goal_async(goal)
         self.get_logger().info("Gripper goal request dispatched.")
         future.add_done_callback(self._goal_response_cb)
@@ -1018,9 +978,22 @@ class Robot(Node):
         if self.mock_mode or self.sim_mode:
             self.get_logger().info(f"Mock/sim mode active: Arm {'lifting' if direction == 1 else 'lowering'} simulated.")
             return
-        cmd = Vector3()
+        cmd = Point()
         cmd.x = 0.0
-        cmd.z = 0.10 * direction
+        cmd.z = 0.15 * direction
+        cmd.y = 0.0
+        self.pub_cmd_arm.publish(cmd)
+
+    def move_arm_using_publisher(self, x, z):
+        if self.mock_mode or self.sim_mode:
+            self.get_logger().info(f"Mock/sim mode active: Arm move to ({x}, {z}) simulated.")
+            return
+        
+        cmd = Point()
+        cmd.x = float(x)
+        cmd.y = 0.0
+        cmd.z = float(z)
+        
         self.pub_cmd_arm.publish(cmd)
 
     def _goal_response_cb(self, future):
@@ -1069,6 +1042,18 @@ class Robot(Node):
         dest = f"Robot {self.pass_to_robot}" if self.pass_to_robot else "the goal"
         self.get_logger().info(f"Releasing / Shooting the puck to {dest}...")
 
+    def publish_ready_to_receive_puck(self, ready=True):
+        msg = Bool()
+        msg.data = ready
+        self.pub_ready_to_receive_puck.publish(msg)
+        self.get_logger().info(f"Published ready_to_receive_pass: {ready}")
+
+    def publish_ready_to_pass_puck(self, ready=True):
+        msg = Bool()
+        msg.data = ready
+        self.pub_ready_to_pass_puck.publish(msg)
+        self.get_logger().info(f"Published ready_to_pass_puck: {ready}")
+
 def main(args=None):
     parser = argparse.ArgumentParser(description='Move Robot Node with CLF-CBF Obstacle Avoidance')
     parser.add_argument('--robot_id', type=int, required=True, help='ID of the robot to control')
@@ -1076,7 +1061,7 @@ def main(args=None):
     parser.add_argument('--hockey_stick_id', type=int, default=1, help='ID tag integer for the hockey stick VRPN tracking topic')
     parser.add_argument('--puck_color', type=str, default='blue', help='Color tag string for the puck VRPN tracking topic')
     parser.add_argument('--mock_mode', action='store_true', help='Enable mock mode for testing without real VRPN data')
-    parser.add_argument('--sim_mode', action='store_true', help='Fake gripper/arm actions but use real /vrpn_mocap topics (for the Docker multi_robomaster_ros_sim simulator)')
+    parser.add_argument('--sim_mode', action='store_true', help='Fake gripper/arm actions but use real /vrpn_mocap topics')
     parser.add_argument('--orient_to_stick', action='store_true', help='Enable terminal angle orientation alignment for the hockey stick')
     parser.add_argument('--sideways_offset', type=float, default=0.0, help="Sideways offset for hockey stick pose")
     parser.add_argument('--vertical_offset', type=float, default=0.0, help="Vertical offset for hockey stick pose")
@@ -1084,46 +1069,39 @@ def main(args=None):
     parser.add_argument('--r_safety', type=float, default=0.35, help='Safety radius for obstacle avoidance')
     parser.add_argument('--l', type=float, default=0.15, help='Look-ahead center to end-effector displacement distance')
     parser.add_argument('--tolerance', type=float, default=0.15, help='Target proximity threshold radius')
-    parser.add_argument('--hit_mode', action='store_true', help='Pass/shoot by spinning the carried stick into the puck (replaces the RELEASE_PUCK stub)')
-    parser.add_argument('--wait_for_pass', action='store_true', help='Shooter role: park at the goal standoff and wait for the pass before approaching the puck')
-    parser.add_argument('--swing_offset', type=float, default=0.55, help='Perpendicular park distance from the puck when preparing a hit (~ carried stick tip length)')
+    parser.add_argument('--hit_mode', action='store_true', help='Pass/shoot by spinning the carried stick into the puck')
+    parser.add_argument('--wait_for_pass', action='store_true', help='Shooter role: park at the goal standoff and wait for the pass')
+    parser.add_argument('--swing_offset', type=float, default=0.55, help='Perpendicular park distance from the puck when preparing a hit')
     parser.add_argument('--wait_radius', type=float, default=3.0, help='Puck arriving within this range of the shooter triggers the shot phase')
-    parser.add_argument('--hit_spin_speed', type=float, default=4.0, help='Angular speed (rad/s) of the hit swing; launch speed ~= this * swing_offset')
-    parser.add_argument('--hit_swing_angle', type=float, default=4.71, help='Total swing sweep angle (rad); contact happens ~pi in')
+    parser.add_argument('--hit_spin_speed', type=float, default=4.0, help='Angular speed (rad/s) of the hit swing')
+    parser.add_argument('--hit_swing_angle', type=float, default=4.71, help='Total swing sweep angle (rad)')
     parser.add_argument('--goal_x', type=float, default=0.0, help='Goal mouth center x (m)')
     parser.add_argument('--goal_y', type=float, default=-1.75, help='Goal mouth center y (m)')
-    parser.add_argument('--goal_yaw_deg', type=float, default=90.0, help='Goal facing direction (deg); mouth opens along it')
-    parser.add_argument('--shoot_mode', type=str, default='swing', choices=['swing', 'push'],
-                        help='swing: spin the stick to hit the puck; push: side-gripped stick shepherds the puck into the goal')
-    parser.add_argument('--push_b_fwd', type=float, default=0.45, help='Blade contact point: forward offset from robot center (m); must be > 0')
-    parser.add_argument('--push_b_lat', type=float, default=-0.25, help='Blade contact point: lateral offset (m); negative = right side (right-side grip)')
-    parser.add_argument('--push_speed', type=float, default=0.35, help='Pushing creep speed (m/s); a released puck slides ~speed/0.8 m in the sim')
-    parser.add_argument('--push_follow_gap', type=float, default=0.5, help='Staging distance behind the puck before aligning to push (m)')
+    parser.add_argument('--goal_yaw_deg', type=float, default=90.0, help='Goal facing direction (deg)')
+    parser.add_argument('--shoot_mode', type=str, default='swing', choices=['swing', 'push'], help='swing: spin the stick; push: shepherd puck into goal')
+    parser.add_argument('--push_b_fwd', type=float, default=0.45, help='Blade contact point: forward offset from robot center (m)')
+    parser.add_argument('--push_b_lat', type=float, default=-0.25, help='Blade contact point: lateral offset (m)')
+    parser.add_argument('--push_speed', type=float, default=0.35, help='Pushing creep speed (m/s)')
+    parser.add_argument('--push_follow_gap', type=float, default=0.5, help='Staging distance behind the puck (m)')
     parser.add_argument('--push_release_dist', type=float, default=0.4, help='Release the puck when it is this close to the goal (m)')
 
     args, remaining = parser.parse_known_args(args)
     if args.mock_mode and args.sim_mode:
         parser.error('--mock_mode and --sim_mode are mutually exclusive')
     if args.push_b_fwd <= 0.05:
-        parser.error('--push_b_fwd must be positive (a purely lateral blade point cannot be servoed by a unicycle)')
-    # Leftover args are forwarded to rclpy, which silently discards unknown ones — so a
-    # typo like --sideway_offset would be ignored without a trace. Reject any flag-like
-    # token that appears before --ros-args.
-    typo_flags = []
-    for tok in remaining:
-        if tok == '--ros-args':
-            break
-        if tok.startswith('--'):
-            typo_flags.append(tok)
+        parser.error('--push_b_fwd must be positive')
+
+    typo_flags = [tok for tok in remaining if tok != '--ros-args' and tok.startswith('--')]
     if typo_flags:
-        parser.error(f"unrecognized arguments: {' '.join(typo_flags)} (typo? see --help for valid flags)")
+        parser.error(f"unrecognized arguments: {' '.join(typo_flags)}")
+
     rclpy.init(args=remaining)
     node = Robot(
         robot_id=args.robot_id, 
         pass_to_robot=args.pass_to_robot, 
         hockey_stick_id=args.hockey_stick_id,
         puck_color=args.puck_color,
-        mock_mode=args.mock_mode,
+        mock_mode=args.mock_mode, 
         sim_mode=args.sim_mode,
         orient_to_stick=args.orient_to_stick,
         l_default=args.l,
