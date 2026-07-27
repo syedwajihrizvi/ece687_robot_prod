@@ -9,7 +9,7 @@ from rclpy.qos import QoSProfile, ReliabilityPolicy
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.callback_groups import ReentrantCallbackGroup
 from robomaster_msgs.action import GripperControl, MoveArm
-from geometry_msgs.msg import Twist, PoseStamped, Vector3
+from geometry_msgs.msg import Twist, PoseStamped, Vector3, Point
 from scipy.optimize import minimize
 
 """
@@ -45,7 +45,7 @@ class Robot(Node):
                  puck_color='blue', 
                  mock_mode=False, 
                  orient_to_stick=False, 
-                 l_default=0.15, 
+                 l_default=0.36, 
                  tolerance_default=0.15, 
                  sideways_offset=0.0, 
                  vertical_offset=0.0, 
@@ -55,7 +55,7 @@ class Robot(Node):
         self.robot_id = robot_id
         self.robot_name = f'/robot{robot_id}'
         self.gripper_action = f'/robot{robot_id}/gripper'
-        self.arm_action = f'/robot{robot_id}/arm'
+        self.arm_action = f'/robot{robot_id}/move_arm'
         self.pass_to_robot = pass_to_robot
         self.hockey_stick_id = hockey_stick_id
         self.puck_color = puck_color
@@ -95,8 +95,9 @@ class Robot(Node):
         # Controller tunings & parameters
         self.declare_parameter('control_frequency', 10.0)
         self.declare_parameter('kp_v', 1.2)
-        self.declare_parameter('kp_w', 2.0)
+        self.declare_parameter('kp_w', 1.0)
         self.declare_parameter('v_max', 1.0)  # Maximum workspace velocity cap (m/s)
+        self.l = l_default
         self.declare_parameter('l', l_default)
         self.declare_parameter('tolerance', tolerance_default)
         self.declare_parameter('standoff_distance', standoff_distance)
@@ -106,7 +107,7 @@ class Robot(Node):
         
         self.current_sequence = Sequence(self.get_parameter('start_sequence').value)
 
-        self.L_inv = np.array([[1, 0], [0, 1 / self.get_parameter('l').value]])
+        self.L_inv = np.array([[1, 0], [0, 1 / self.l]])
         self._action_group = ReentrantCallbackGroup()
         self.gripper_action_client = None
         self.arm_action_client = None
@@ -125,11 +126,11 @@ class Robot(Node):
             self.arm_action_client = ActionClient(
                 self,
                 MoveArm,
-                self.arm_action,
+                self.arm_action, 
                 callback_group=self._action_group
             )
             self.get_logger().info("Waiting for arm action server...")
-            self.arm_action_client.wait_for_server()
+            # self.arm_action_client.wait_for_server()
             self.get_logger().info("Arm action server is available.")
 
         time_period = 1.0 / self.get_parameter('control_frequency').value
@@ -159,7 +160,7 @@ class Robot(Node):
                 self.create_subscription(PoseStamped, topic_name, self.obstacle_pos_callback(key), qos)
             
         self.pub_cmd_vel = self.create_publisher(Twist, f'{self.robot_name}/cmd_vel', 10)
-        self.pub_cmd_arm = self.create_publisher(Vector3, f'{self.robot_name}/cmd_arm', 10)
+        self.pub_cmd_arm = self.create_publisher(Point, f'{self.robot_name}/target_arm_position', 10)
         self.get_logger().info(f'Robot node initialized at sequence state: {self.current_sequence.name} with stick ID: {self.hockey_stick_id} & puck color: {self.puck_color}')
 
     def advance_sequence(self):
@@ -342,6 +343,7 @@ class Robot(Node):
         return float(self.filtered_u_p[0]), float(self.filtered_u_p[1])
 
     def control_loop(self):
+        self.get_logger().info(f"Current Sequence: {self.current_sequence}")
         if self.robot_pose is None:
             self.get_logger().warn("Waiting for robot pose...", throttle_duration_sec=2.0)
             return
@@ -362,27 +364,14 @@ class Robot(Node):
 
         # Sequence 1: Move Arm to Origin Action (0.0, 0.0)
         elif self.current_sequence == Sequence.MOVE_EE_TO_ORIGIN:
-            if self.state_start_time is None:
-                elapsed_retry_time = 3.0
-            else:
-                elapsed_retry_time = (now - self.state_start_time).nanoseconds / 1e9
-            if elapsed_retry_time >= 3.0 and not self.arm_action_running:
-                self.get_logger().info("Sequence 1: Dispatching arm move to origin request...")
-                self.state_start_time = now 
-                self.arm_action_running = True
-                self.move_arm_using_action(x=0.0, z=0.0, relative=False)
+            self.move_arm_using_publisher(x=0.0, z=0.0)
+            self.advance_sequence()
 
         # Sequence 2: Move Arm to Ref Pos Action (0.15, 0.15)
         elif self.current_sequence == Sequence.MOVE_EE_TO_REF_POS:
-            if self.state_start_time is None:
-                elapsed_retry_time = 3.0
-            else:
-                elapsed_retry_time = (now - self.state_start_time).nanoseconds / 1e9
-            if elapsed_retry_time >= 3.0 and not self.arm_action_running:
-                self.get_logger().info("Sequence 2: Dispatching arm move to reference position request...")
-                self.state_start_time = now 
-                self.arm_action_running = True
-                self.move_arm_using_action(x=0.15, z=0.15, relative=False)
+            self.move_arm_using_publisher(x=0.0, z=0.0)
+            self.l = 0.36
+            self.advance_sequence()
 
         # Sequence 3 & 7: Spatial Tracking with CLF-CBF
         elif self.current_sequence in [Sequence.MOVE_TO_STICK, Sequence.MOVE_TO_PUCK]:
@@ -482,7 +471,7 @@ class Robot(Node):
             self.pub_cmd_vel.publish(Twist())
 
     def nid_to_move_robot(self):
-        l = self.get_parameter('l').value
+        l = self.l
         tolerance = self.get_parameter('tolerance').value
         Kp_v = self.get_parameter('kp_v').value
         Kp_w = self.get_parameter('kp_w').value
@@ -560,6 +549,7 @@ class Robot(Node):
             # Stage 3: Drive final approach to stick
             elif self.seq1_stage == 3:
                 dist = np.sqrt((target_x - p_xl)**2 + (target_y - p_yl)**2)
+                self.get_logger().info(f"Distance to stick: {dist}")
                 if dist <= tolerance:
                     self.seq1_completed = True 
                     return 0.0, 0.0  
@@ -628,6 +618,7 @@ class Robot(Node):
         self.get_logger().info("Gripper Operation running...") 
         goal = GripperControl.Goal()
         goal.target_state = 1 if open else 2
+        goal.power = 1.0
         future = self.gripper_action_client.send_goal_async(goal)
         self.get_logger().info("Gripper goal request dispatched.")
         future.add_done_callback(self._goal_response_cb)
@@ -652,9 +643,22 @@ class Robot(Node):
         if self.mock_mode:
             self.get_logger().info(f"Mock mode active: Arm {'lifting' if direction == 1 else 'lowering'} simulated.")
             return
-        cmd = Vector3()
+        cmd = Point()
         cmd.x = 0.0
-        cmd.z = 0.10 * direction
+        cmd.z = 0.15
+        cmd.y = 0.0
+        self.pub_cmd_arm.publish(cmd)
+
+    def move_arm_using_publisher(self, x, z):
+        if self.mock_mode:
+            self.get_logger().info(f"Mock mode active: Arm move to ({x}, {z}) simulated.")
+            return
+        
+        cmd = Point()
+        cmd.x = float(x)
+        cmd.y = 0.0  # Explicitly set y to float zero
+        cmd.z = float(z)
+        
         self.pub_cmd_arm.publish(cmd)
 
     def _goal_response_cb(self, future):
